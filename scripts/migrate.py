@@ -103,6 +103,16 @@ BEGIN
   VALUES (OLD.id, OLD.version, OLD.title, OLD.content, 'auto');
   UPDATE memories SET version = OLD.version + 1 WHERE id = OLD.id;
 END;
+
+CREATE TABLE IF NOT EXISTS alterations (
+  id          INTEGER PRIMARY KEY,
+  memory_uid  TEXT NOT NULL,
+  ts          TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  delta       TEXT,
+  reason      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alterations_uid ON alterations(memory_uid);
 """
 
 TYPE_ALIASES = [

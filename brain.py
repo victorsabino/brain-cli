@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import secrets
 import sqlite3
 import sys
@@ -31,7 +32,9 @@ from base64 import b32encode
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB = Path.home() / "brain.db"
+# DB path: overridable via BRAIN_DB env var (enables safe testing against a
+# throwaway copy). Defaults to ~/brain.db — unchanged behavior when unset.
+DB = Path(os.environ.get("BRAIN_DB") or (Path.home() / "brain.db"))
 
 CANONICAL_TYPES = {"learning", "decision", "bug", "snippet", "note", "task", "person", "project"}
 LINK_KINDS = {"cites", "caused_by", "fixed_by", "superseded_by", "blocks", "related_to", "duplicate_of"}
@@ -88,6 +91,43 @@ def gen_uid() -> str:
 
 def content_hash(title: str, content: str) -> str:
     return hashlib.sha256(f"{title}\n{content or ''}".encode()).hexdigest()[:16]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Alterations (revision audit trail)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def ensure_alterations_table(conn: sqlite3.Connection) -> None:
+    """Idempotent. Tracks every mutation (create/append/replace/delete) to a memory.
+
+    Lazy — called from the commands that write alterations so we never force a
+    full re-migrate. Also created by `brain migrate`.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alterations (
+            id          INTEGER PRIMARY KEY,
+            memory_uid  TEXT NOT NULL,
+            ts          TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            delta       TEXT,
+            reason      TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alterations_uid ON alterations(memory_uid)"
+    )
+
+
+def log_alteration(conn, uid: str, kind: str, delta: str | None = None,
+                   reason: str | None = None) -> None:
+    """Insert one alterations row. Caller commits."""
+    ensure_alterations_table(conn)
+    conn.execute(
+        "INSERT INTO alterations(memory_uid, ts, kind, delta, reason) "
+        "VALUES (?, datetime('now'), ?, ?, ?)",
+        (uid, kind, delta, reason),
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -183,6 +223,9 @@ def cmd_save(args) -> int:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, args.status or "pending", args.priority, args.energy, args.points,
               args.due_at, args.external_ref, args.parent_uid))
+
+    # Audit trail: record creation.
+    log_alteration(conn, uid, "create", delta=title, reason=None)
 
     conn.commit()
 
@@ -384,9 +427,11 @@ def cmd_delete(args) -> int:
         "UPDATE memories SET deleted_at = datetime('now') WHERE uid = ? AND deleted_at IS NULL",
         (args.uid,),
     )
-    conn.commit()
     if cursor.rowcount == 0:
+        conn.commit()
         return _err(f"uid {args.uid} not found or already deleted")
+    log_alteration(conn, args.uid, "delete", delta=None, reason=None)
+    conn.commit()
     print(f"deleted {args.uid}")
     return 0
 
@@ -401,6 +446,100 @@ def cmd_restore(args) -> int:
     if cursor.rowcount == 0:
         return _err(f"uid {args.uid} not found or not deleted")
     print(f"restored {args.uid}")
+    return 0
+
+
+def cmd_update(args) -> int:
+    """Mutate an existing memory's content (append or replace), log an alteration.
+
+    --append "<text>"   → append a dated bullet to content
+    --replace "<text>"  → replace the full content
+
+    Keeps content_hash, updated_at, FTS (trigger-synced), and embeddings in sync.
+    """
+    if not args.append and args.replace is None:
+        return _err("provide --append \"<text>\" or --replace \"<full content>\"")
+    if args.append and args.replace is not None:
+        return _err("use only one of --append / --replace, not both")
+
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+
+    row = cursor.execute(
+        "SELECT id, title, content, deleted_at FROM memories WHERE uid = ?",
+        (args.uid,),
+    ).fetchone()
+    if not row:
+        return _err(f"uid {args.uid} not found")
+    if row["deleted_at"] is not None:
+        return _err(f"uid {args.uid} is soft-deleted — `brain restore {args.uid}` first")
+
+    memory_id = row["id"]
+    title = row["title"]
+    old_content = row["content"] or ""
+
+    if args.append:
+        text = args.append.strip()
+        if not text:
+            return _err("--append text must not be empty")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        bullet = f"\n\n- [{today}] {text}"
+        new_content = old_content + bullet
+        kind = "append"
+        delta = bullet.strip()
+    else:
+        new_content = args.replace
+        kind = "replace"
+        delta = new_content
+
+    new_hash = content_hash(title, new_content)
+
+    # The AFTER UPDATE trigger on memories re-syncs memories_fts automatically,
+    # and a BEFORE UPDATE trigger snapshots the old content into memory_versions.
+    cursor.execute(
+        "UPDATE memories SET content = ?, content_hash = ?, updated_at = datetime('now') "
+        "WHERE id = ?",
+        (new_content, new_hash, memory_id),
+    )
+
+    log_alteration(conn, args.uid, kind, delta=delta, reason=args.reason)
+    conn.commit()
+
+    # Re-embed (after commit so the update still succeeds if the model is absent).
+    if _vec_loaded:
+        vec = embed(f"{title}\n{new_content}")
+        if vec is not None:
+            try:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
+                    (memory_id, vec),
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+    print(args.uid)
+    return 0
+
+
+def cmd_history(args) -> int:
+    """Print the alterations log for one memory, chronologically."""
+    conn = connect()
+    ensure_alterations_table(conn)
+    rows = conn.execute(
+        "SELECT ts, kind, reason, delta FROM alterations "
+        "WHERE memory_uid = ? ORDER BY ts ASC, id ASC",
+        (args.uid,),
+    ).fetchall()
+    if not rows:
+        print(f"no alterations recorded for {args.uid}")
+        return 0
+    for r in rows:
+        reason = r["reason"] or ""
+        delta = (r["delta"] or "").replace("\n", " ")
+        if len(delta) > 80:
+            delta = delta[:80] + "…"
+        print(f"{r['ts']} | {r['kind']:7} | {reason:24} | {delta}")
     return 0
 
 
@@ -598,6 +737,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("restore", help="Restore a soft-deleted memory")
     s.add_argument("uid")
     s.set_defaults(func=cmd_restore)
+
+    # update
+    s = sub.add_parser("update", help="Append to or replace a memory's content (merge)")
+    s.add_argument("uid")
+    s.add_argument("--append", help="append a dated bullet to content")
+    s.add_argument("--replace", help="replace the full content")
+    s.add_argument("--reason", help="why this change (recorded in alterations)")
+    s.set_defaults(func=cmd_update)
+
+    # history
+    s = sub.add_parser("history", help="Show the alterations log for a memory")
+    s.add_argument("uid")
+    s.set_defaults(func=cmd_history)
 
     # tags
     s = sub.add_parser("tags", help="List tags by use count")
