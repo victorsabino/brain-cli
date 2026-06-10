@@ -15,6 +15,18 @@ Roo Code, Continue, Goose — point it at the `brain` binary and give it
 the save/search conventions in your rules file (CLAUDE.md, .cursorrules,
 AGENTS.md, etc.).
 
+## 🤖 For agents (and the humans who run them)
+
+**Agents:** read [AGENTS.md](AGENTS.md) and follow it — it's an executable
+runbook that walks you through installing brain, interviewing your user
+(install method, semantic search on/off, DB location), verifying the setup,
+and wiring memory conventions + an optional auto-capture hook into your own
+rules file. Every step that touches the user's machine asks for consent first.
+
+**Humans:** the whole setup is one sentence to your agent:
+
+> Read https://github.com/victorsabino/brain-cli/blob/main/AGENTS.md and set up brain for me.
+
 ```bash
 brain save  --type=learning --title="..." --content="..." --tags=a,b,c
 brain search "natural language query" --limit=10
