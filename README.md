@@ -1,8 +1,11 @@
 # brain — personal knowledge CLI for ~/brain.db
 
-Single-file Python CLI that replaces every raw `sqlite3 ~/brain.db "..."` call
-with typed, validated, embedded, deduplicated commands. v3 schema additive over
-the original brain.db; no destructive migration.
+Single-file Python CLI for a local, SQLite-backed agent memory: typed,
+validated, embedded, deduplicated commands over `~/brain.db` (override with
+`BRAIN_DB=/path/to.db`). Hybrid retrieval — porter-stemmed FTS5 + chunked
+384-dim embeddings (sqlite-vec, cosine) fused with reciprocal-rank fusion.
+v3 schema is additive over any existing `memories` table; no destructive
+migration. Built to be driven by LLM agents (Claude Code, etc.) without SQL.
 
 ```bash
 brain save  --type=learning --title="..." --content="..." --tags=a,b,c
@@ -26,21 +29,27 @@ brain migrate     # apply v3 schema
 | Synonym expansion in every prompt | semantic search via sentence-transformers |
 | Duplicate captures | content_hash dedup with explicit `--force` |
 | 12 ambiguous types | 8 canonical + alias map (insight→learning, etc.) |
-| No retention/decay | recency boost (365-day half-life) + access count |
+| No retention/decay | small additive recency/access tiebreakers (capped) |
 | No soft delete | `deleted_at` column |
 
 ## Install
 
 ```bash
+# via uv (recommended — deps declared inline in brain.py):
+uv run brain.py migrate               # additive, idempotent
+uv run brain.py reindex --full        # chunked embeddings, ~4min for 1.3K memories
+
+# or system python:
 pip3 install --break-system-packages sqlite-vec sentence-transformers
-python3 scripts/migrate.py            # additive, idempotent
+python3 scripts/migrate.py
 ln -sf $PWD/brain.py ~/bin/brain
-~/bin/brain reindex                   # ~5s for 800 memories on M-series
 ```
+
+Point at a different DB (testing, multiple brains): `BRAIN_DB=/tmp/test.db brain ...`
 
 ## Schema additions (v3)
 
-Aditive over the original `memories`, `memories_fts`, `stats` tables.
+Additive over the original `memories`, `memories_fts`, `stats` tables.
 
 **New columns on `memories`**: `content_hash`, `deleted_at`, `last_accessed_at`,
 `access_count`, `version`, `superseded_by`, `canonical_type`.
@@ -52,26 +61,47 @@ Aditive over the original `memories`, `memories_fts`, `stats` tables.
 - `memory_links(src_id, dst_id, kind)` — typed relations
 - `memory_versions(memory_id, version, title, content, ...)` — light versioning
 - `type_aliases(alias, canonical)` — type canonicalization
-- `memory_vectors` (vec0 virtual) — 384-dim embeddings via sqlite-vec
+- `memory_chunks` (vec0 virtual, cosine) — 384-dim chunked embeddings via sqlite-vec
+- `memory_vectors` (vec0 virtual) — legacy single-vector table, read-only fallback
+- `alterations(memory_uid, ts, kind, delta, reason)` — mutation audit trail
 
 **Schema version marker**: `stats.brain_schema_version = '3'`.
 
+## Search
+
+Two ranked candidate lists, fused by rank — never by raw score:
+
+1. **Keyword** — FTS5 (`porter unicode61`), OR-mode terms, ordered by weighted
+   bm25 (title 4×, tags 3×, project 2×, content 1×). Filters (`--type`,
+   `--project`, `--since-days`) apply before the limit.
+2. **Semantic** — query embedded with `paraphrase-multilingual-MiniLM-L12-v2`
+   (384-dim, multilingual), KNN over `memory_chunks` (cosine), best chunk per
+   memory.
+
+```
+score = RRF / (2/(k+1))            # reciprocal-rank fusion, k=60, normalized
+      + 0.05 * exp(-age_days/365)  # recency: additive tiebreaker
+      + min(0.03, 0.01 * ln(1 + access_count))  # access: capped tiebreaker
+```
+
+RRF is scale-free, so bm25 magnitudes and cosine similarities never need a
+shared scale. `access_count` is bumped only on `brain get` — search never
+reinforces its own ranking. Empty query + filters = plain listing
+(`brain search "" --type=task` lists newest tasks).
+
 ## Embeddings
 
-Model: `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, ~470MB, handles PT/EN).
-Storage: ~1.5KB per memory in `memory_vectors` (1.2MB for 800 entries).
-
-Hybrid search formula:
-```
-final_score = (0.6 * semantic + 0.4 * BM25) * recency_boost * access_boost
-recency_boost = exp(-age_days / 365)
-access_boost  = 1 + log(access_count + 1)
-```
+Content is split into ~500-char paragraph chunks, title prepended to each, one
+vector per chunk (`memory_chunks`, rowid = `memory_id * 64 + chunk_index`).
+This keeps every chunk inside the model's ~128-token window, so long memories
+and appended updates stay semantically findable. `save` and `update` re-embed
+automatically; `reindex` backfills missing, `reindex --full` rebuilds all.
 
 ## Backwards compat
 
-The original `~/bin/brain` script (search-only) is preserved as `~/bin/brain.legacy`.
-Old commands `brain query` and `brain add` still work as aliases for `search` and `save`.
+Old commands `brain query` and `brain add` still work as aliases for `search`
+and `save`. Pre-migration DBs (no `memory_chunks`) fall back to the legacy
+single-vector `memory_vectors` table.
 
 ## Roadmap
 
