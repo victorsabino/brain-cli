@@ -1,0 +1,12 @@
+{"query": "kiosk stuck rebooting after firmware update", "expected_uid": "nb5b7ftv5tth", "note": "paraphrase"}
+{"query": "permit uploads failing with 502 on large pdf files", "expected_uid": "fmgigjqdy67r", "note": "paraphrase"}
+{"query": "bus positions stale after midnight", "expected_uid": "43i2o5222zi5", "note": "paraphrase"}
+{"query": "siren cron fires twice during dst", "expected_uid": "vzcemec67rga", "note": "paraphrase"}
+{"query": "webhook signature mismatch emoji payload", "expected_uid": "7lqkddp4u2ql", "note": "paraphrase"}
+{"query": "websocket drops during cellular handoff heartbeat", "expected_uid": "u5nq22scvm66", "note": "paraphrase"}
+{"query": "decorative svg icons false positives accessibility scanner", "expected_uid": "ln626ukk4kaa", "note": "paraphrase"}
+{"query": "brin versus btree for sensor telemetry", "expected_uid": "3wihwk5pkmr3", "note": "paraphrase"}
+{"query": "offline-first sqlite cache for the mobile app", "expected_uid": "5wxc7vcegohu", "note": "decision"}
+{"query": "parquet compaction zstd level", "expected_uid": "w47rat2iycdh", "note": "tail: dated bullet at END of long log"}
+{"query": "deep links blank screen on cold start android", "expected_uid": "bps7lpzx2ak7", "note": "paraphrase"}
+{"query": "banker's rounding broke fare reconciliation", "expected_uid": "wdofc7jrtsky", "note": "paraphrase"}

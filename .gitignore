@@ -4,3 +4,7 @@ __pycache__/
 .DS_Store
 *.log
 brain.db.pre-*-backup-*
+# Real-data golden sets (real uids/titles) — never commit. The synthetic
+# fixture golden is explicitly re-allowed below.
+golden*.jsonl
+!tests/fixtures/golden_synthetic.jsonl
