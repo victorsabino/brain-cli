@@ -1,7 +1,7 @@
 # brain — local memory for AI agents, in a single Python file
 
-A persistent memory / personal knowledge base CLI for LLM agents (Claude
-Code, custom agents) and humans: save, search, link and dedupe learnings,
+A persistent memory / personal knowledge base CLI for LLM coding agents
+(Claude Code, Cursor, custom agents) and humans: save, search, link and dedupe learnings,
 decisions, bugs, snippets and tasks in one local SQLite file. Hybrid
 semantic + keyword search — porter-stemmed FTS5 plus chunked 384-dim
 embeddings (sqlite-vec, cosine) fused with reciprocal rank fusion (RRF).
