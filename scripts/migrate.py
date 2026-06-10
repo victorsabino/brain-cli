@@ -2,14 +2,27 @@
 """brain v3 migration runner. Idempotent. Safe to re-run."""
 
 from __future__ import annotations
+import argparse
 import hashlib
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 DB = Path(os.environ.get("BRAIN_DB") or (Path.home() / "brain.db"))
 HERE = Path(__file__).resolve().parent
+
+# Version this script produces. A DB reporting a HIGHER version was written by
+# a newer brain — running an old migrator against it could silently downgrade.
+SCHEMA_VERSION = 3
+
+# Tables created by SCHEMA_SQL / setup_vec_extension — used for dry-run planning.
+SCHEMA_TABLES = [
+    "tags", "memory_tags", "type_aliases", "task_meta",
+    "memory_links", "memory_versions", "alterations",
+]
+VEC_TABLES = ["memory_vectors", "memory_chunks"]
 
 # All ALTER TABLE statements run individually with duplicate-tolerance.
 NEW_COLUMNS = [
@@ -270,6 +283,14 @@ def setup_vec_extension(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def fts_needs_rebuild(conn: sqlite3.Connection) -> bool:
+    """True when memories_fts is missing or not yet porter-tokenized."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'memories_fts' AND type = 'table'"
+    ).fetchone()
+    return not (row and "porter" in (row[0] or ""))
+
+
 def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
     """Recreate memories_fts with porter stemming (migration/migrations match).
 
@@ -277,10 +298,7 @@ def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
     lives in memories. Triggers are recreated identically. Idempotent: skips
     when the table already uses porter.
     """
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name = 'memories_fts' AND type = 'table'"
-    ).fetchone()
-    if row and "porter" in (row[0] or ""):
+    if not fts_needs_rebuild(conn):
         return False
     conn.executescript("""
         DROP TRIGGER IF EXISTS memories_ai;
@@ -314,18 +332,100 @@ def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
 
 def mark_schema_version(conn: sqlite3.Connection) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO stats(key, value, updated_at) VALUES ('brain_schema_version', '3', datetime('now'))"
+        "INSERT OR REPLACE INTO stats(key, value, updated_at) VALUES "
+        f"('brain_schema_version', '{SCHEMA_VERSION}', datetime('now'))"
     )
     conn.commit()
 
 
+def read_schema_version(conn: sqlite3.Connection) -> int | None:
+    """Current brain_schema_version as int, or None (pre-v3 / unparseable)."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM stats WHERE key = 'brain_schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no stats table yet — pre-v3 DB
+    if not row:
+        return None
+    try:
+        return int(str(row[0]).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def build_plan(conn: sqlite3.Connection) -> dict:
+    """Inspect the DB without writing; returns what migration would do."""
+    have_cols = existing_columns(conn, "memories")
+    have_tables = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    return {
+        "columns_to_add": [c for c, _ in NEW_COLUMNS if c not in have_cols],
+        "tables_to_create": [t for t in SCHEMA_TABLES + VEC_TABLES if t not in have_tables],
+        "fts_rebuild": fts_needs_rebuild(conn),
+    }
+
+
+def backup_db(conn: sqlite3.Connection) -> Path:
+    """Snapshot the DB next to itself before destructive work.
+
+    Uses the sqlite backup API (not a file copy) so pending WAL pages are
+    included and the snapshot is consistent even with the connection open.
+    """
+    dest = DB.with_name(f"{DB.name}.bak-migrate-{time.strftime('%Y%m%d-%H%M%S')}")
+    out = sqlite3.connect(dest)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+    return dest
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description="brain v3 migration runner (idempotent)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print what would run and exit without writing")
+    ap.add_argument("--no-backup", action="store_true",
+                    help="skip the pre-destructive-step DB backup")
+    args = ap.parse_args()
+
     if not DB.exists():
         print(f"✗ {DB} does not exist. Aborting.", file=sys.stderr)
         return 1
 
-    print(f"→ migrating {DB}")
     conn = open_db()
+
+    # Forward-compatibility guard: never run an old migrator on a newer DB.
+    db_version = read_schema_version(conn)
+    if db_version is not None and db_version > SCHEMA_VERSION:
+        print(
+            f"✗ {DB} reports schema version {db_version}, but this script only "
+            f"produces version {SCHEMA_VERSION}. Refusing to migrate a "
+            f"forward-incompatible DB — upgrade brain-cli instead.",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 1
+
+    plan = build_plan(conn)
+    will_backup = plan["fts_rebuild"] and not args.no_backup
+
+    if args.dry_run:
+        print(f"→ dry-run for {DB} (schema version: {db_version or 'unset'})")
+        print(f"  • columns to add: {', '.join(plan['columns_to_add']) or '(none)'}")
+        print(f"  • tables to create: {', '.join(plan['tables_to_create']) or '(none)'}")
+        print(f"  • FTS porter rebuild: {'yes (destructive drop/rebuild)' if plan['fts_rebuild'] else 'no — already porter'}")
+        print(f"  • backup: {'yes — .bak-migrate-<timestamp>' if will_backup else 'no' + (' (--no-backup)' if args.no_backup and plan['fts_rebuild'] else ' — nothing destructive')}")
+        print("  (no changes written)")
+        conn.close()
+        return 0
+
+    print(f"→ migrating {DB}")
+
+    if will_backup:
+        dest = backup_db(conn)
+        print(f"  • backup → {dest}")
 
     print("  • adding new columns to memories")
     n = add_columns(conn)
