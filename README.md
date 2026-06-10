@@ -1,11 +1,13 @@
-# brain — personal knowledge CLI for ~/brain.db
+# brain — local memory for AI agents, in a single Python file
 
-Single-file Python CLI for a local, SQLite-backed agent memory: typed,
-validated, embedded, deduplicated commands over `~/brain.db` (override with
-`BRAIN_DB=/path/to.db`). Hybrid retrieval — porter-stemmed FTS5 + chunked
-384-dim embeddings (sqlite-vec, cosine) fused with reciprocal-rank fusion.
-v3 schema is additive over any existing `memories` table; no destructive
-migration. Built to be driven by LLM agents (Claude Code, etc.) without SQL.
+A persistent memory / personal knowledge base CLI for LLM agents (Claude
+Code, custom agents) and humans: save, search, link and dedupe learnings,
+decisions, bugs, snippets and tasks in one local SQLite file. Hybrid
+semantic + keyword search — porter-stemmed FTS5 plus chunked 384-dim
+embeddings (sqlite-vec, cosine) fused with reciprocal rank fusion (RRF).
+No server, no cloud, no SQL required: typed argparse commands over
+`~/brain.db` (override with `BRAIN_DB=/path/to.db`). The v3 schema is
+additive over any existing `memories` table; no destructive migration.
 
 ```bash
 brain save  --type=learning --title="..." --content="..." --tags=a,b,c
