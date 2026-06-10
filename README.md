@@ -9,6 +9,12 @@ No server, no cloud, no SQL required: typed argparse commands over
 `~/brain.db` (override with `BRAIN_DB=/path/to.db`). The v3 schema is
 additive over any existing `memories` table; no destructive migration.
 
+Works with any agent that can run a shell command: Claude Code, Cursor,
+Windsurf, GitHub Copilot, OpenAI Codex CLI, Gemini CLI, Aider, Cline,
+Roo Code, Continue, Goose — point it at the `brain` binary and give it
+the save/search conventions in your rules file (CLAUDE.md, .cursorrules,
+AGENTS.md, etc.).
+
 ```bash
 brain save  --type=learning --title="..." --content="..." --tags=a,b,c
 brain search "natural language query" --limit=10
