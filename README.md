@@ -64,6 +64,8 @@ Additive over the original `memories`, `memories_fts`, `stats` tables.
 - `memory_chunks` (vec0 virtual, cosine) — 384-dim chunked embeddings via sqlite-vec
 - `memory_vectors` (vec0 virtual) — legacy single-vector table, read-only fallback
 - `alterations(memory_uid, ts, kind, delta, reason)` — mutation audit trail
+- `query_cache(qhash, embedding, created_at)` — query-embedding cache (lazy,
+  capped at 500 rows)
 
 **Schema version marker**: `stats.brain_schema_version = '3'`.
 
@@ -89,6 +91,20 @@ shared scale. `access_count` is bumped only on `brain get` — search never
 reinforces its own ranking. Empty query + filters = plain listing
 (`brain search "" --type=task` lists newest tasks).
 
+Pass `--explain` to see each result's score decomposition: keyword/semantic
+rank, best-chunk cosine similarity, the normalized RRF contribution of each
+side, and the recency/access bonuses. In human output it's one extra line per
+hit; with `--json` each result gains an `explain` object. Set `BRAIN_DEBUG=1`
+to also get stage timings (model load, fts, knn, fusion, total) on stderr.
+
+```
+brain search "deploy regression" --explain
+[bug     ] Rollback loop on deploy (acme)
+           ...
+           2026-05-01 · ab12cd34ef56 · score=1.05  #deploy
+           ↳ fts=#1 sem=#2 sim=0.712 rrf=0.500+0.492 rec=+0.044 acc=+0.011 = 1.047
+```
+
 ## Embeddings
 
 Content is split into ~500-char paragraph chunks, title prepended to each, one
@@ -97,11 +113,64 @@ This keeps every chunk inside the model's ~128-token window, so long memories
 and appended updates stay semantically findable. `save` and `update` re-embed
 automatically; `reindex` backfills missing, `reindex --full` rebuilds all.
 
+### Query-embedding cache
+
+Search caches each query's vector in an ordinary `query_cache` table (created
+lazily on first semantic search; capped at 500 rows, oldest 100 evicted on
+overflow). A repeated query skips the embedding model entirely — it is not
+even lazy-loaded — so repeats run in tens of milliseconds instead of paying
+the ~5–10s model cold start. Novel queries still load the model once per
+process.
+
+### Optional ONNX backend
+
+`BRAIN_EMBED_BACKEND=onnx` switches the embedder to sentence-transformers'
+native ONNX backend. The extra deps are deliberately **not** in the inline uv
+header (they'd bloat every run); install them per-invocation or permanently:
+
+```bash
+# one-off via uv:
+BRAIN_EMBED_BACKEND=onnx uv run --with "optimum[onnxruntime]" brain.py search "..."
+# or permanent: pip3 install "optimum[onnxruntime]"
+```
+
+If the extras are missing, brain falls back to the torch backend (warning
+visible with `BRAIN_DEBUG=1`). Backend vector parity is gated by
+`uv run scripts/check_embed_parity.py` — at min cosine ≥ 0.999 the backends
+are interchangeable; below that, switching requires `reindex --full` to avoid
+mixed-vector-space search. Note: on Apple Silicon the ONNX session init
+(CoreML graph partitioning) can make *load* slower than torch — measure with
+the parity script before adopting; the query cache is usually the bigger win.
+
 ## Backwards compat
 
 Old commands `brain query` and `brain add` still work as aliases for `search`
 and `save`. Pre-migration DBs (no `memory_chunks`) fall back to the legacy
 single-vector `memory_vectors` table.
+
+## Development
+
+Design rationale and invariants: [DESIGN.md](DESIGN.md) · release history:
+[CHANGELOG.md](CHANGELOG.md).
+
+```bash
+# Tests (smoke + update/history suites; FTS-only, no heavy deps needed)
+python3 tests/test_brain.py
+python3 -m pytest tests/test_update_history.py -q
+
+# Never develop against your live ~/brain.db — use the BRAIN_DB seam:
+cp ~/brain.db /tmp/dev.db
+BRAIN_DB=/tmp/dev.db uv run brain.py search "deploy regression" --json
+BRAIN_DB=/tmp/dev.db uv run scripts/migrate.py
+
+# Search-quality eval (recall@1/5, MRR@10 against a golden JSONL set)
+python3 scripts/eval.py --golden ~/.config/brain/golden.jsonl
+python3 scripts/eval.py --golden tests/fixtures/golden_synthetic.jsonl \
+    --db /tmp/fixture.db --no-semantic --min-recall5 1.0
+```
+
+`BRAIN_DB` is honored by both `brain.py` and `scripts/migrate.py`; unset, both
+default to `~/brain.db`.
 
 ## Roadmap
 

@@ -1,0 +1,45 @@
+# Packaging only — `uv run brain.py` keeps using the inline script metadata
+# at the top of brain.py (uv prefers PEP 723 inline deps for direct script
+# runs). This file exists so `pip install .` / `uv tool install .` give a
+# `brain` entry point. Keep deps in sync with the inline block.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brain-cli"
+version = "3.2.0"
+description = "Single-file personal knowledge CLI: typed commands over a SQLite memory DB with hybrid FTS5 + sqlite-vec retrieval (RRF fusion)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+  "sqlite-vec>=0.1.6",
+  "sentence-transformers>=3.0",
+]
+
+[project.scripts]
+brain = "brain:main"
+
+# Single top-level module (no package dir) — ship just brain.py in the wheel.
+[tool.hatch.build.targets.wheel]
+only-include = ["brain.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["brain.py", "scripts", "migrations", "tests", "README.md", "DESIGN.md", "CHANGELOG.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Defaults (E4/E7/E9 + F) are the right altitude for a single-file CLI:
+# real bugs (unused names, stray f-strings), no style churn. E501 stays off —
+# a handful of long SQL/print lines read better unwrapped.
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Hermetic suite: every test builds its DB under tmp_path; ~/brain.db is never opened.
+addopts = "-ra"
