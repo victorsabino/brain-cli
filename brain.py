@@ -29,6 +29,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import time
 from base64 import b32encode
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,11 @@ def connect(load_vec: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA trusted_schema = ON")
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: readers never block the writer (background capture agent vs.
+    # interactive command). Persists in the DB file; re-setting is a no-op.
+    conn.execute("PRAGMA journal_mode = WAL")
+    # Wait out short write locks instead of failing with SQLITE_BUSY.
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
     if load_vec:
         global _vec_loaded
@@ -76,6 +82,19 @@ def connect(load_vec: bool = False) -> sqlite3.Connection:
         except Exception:
             _vec_loaded = False
     return conn
+
+
+def _warn(msg: str) -> None:
+    """Diagnostics for silently-degraded fallback paths. Off by default so
+    graceful degradation stays quiet; BRAIN_DEBUG=1 surfaces them."""
+    if os.environ.get("BRAIN_DEBUG") == "1":
+        print(f"⚠ {msg}", file=sys.stderr)
+
+
+def _timing(stage: str, start: float) -> None:
+    """Stage timing to stderr, gated like _warn — zero noise by default."""
+    if os.environ.get("BRAIN_DEBUG") == "1":
+        print(f"⏱ {stage}: {(time.perf_counter() - start) * 1000:.1f}ms", file=sys.stderr)
 
 
 def aliases(conn: sqlite3.Connection) -> dict[str, str]:
@@ -143,17 +162,38 @@ def log_alteration(conn, uid: str, kind: str, delta: str | None = None,
 
 
 def get_embedder():
-    """Lazy-load sentence-transformers. Returns None if not installed."""
+    """Lazy-load sentence-transformers. Returns None if not installed.
+
+    BRAIN_EMBED_BACKEND=onnx opts into the ONNX runtime (much faster model
+    load than torch; needs optimum+onnxruntime — NOT in the inline deps on
+    purpose, see README). Missing extras or an old sentence-transformers
+    (<3.2, no `backend` kwarg) degrade to the torch backend with a _warn.
+    Backend parity is gated by scripts/check_embed_parity.py — if min cosine
+    between backends ever drops below 0.999, switching requires
+    `reindex --full` to avoid mixed-vector-space search.
+    """
     global _embed_model
     if _embed_model is not None:
         return _embed_model
     try:
         from sentence_transformers import SentenceTransformer
-        # Multilingual, 384-dim, ~470MB, handles PT/EN well.
-        _embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        return _embed_model
     except ImportError:
         return None
+    # Multilingual, 384-dim, ~470MB, handles PT/EN well.
+    model_name = "paraphrase-multilingual-MiniLM-L12-v2"
+    if os.environ.get("BRAIN_EMBED_BACKEND", "").lower() == "onnx":
+        try:
+            import onnxruntime  # noqa: F401 — presence check only
+            import optimum  # noqa: F401
+            _embed_model = SentenceTransformer(model_name, backend="onnx")
+            return _embed_model
+        except ImportError:
+            _warn("BRAIN_EMBED_BACKEND=onnx but optimum/onnxruntime missing; "
+                  "falling back to torch backend")
+        except (TypeError, ValueError, OSError) as e:
+            _warn(f"onnx backend failed ({e}); falling back to torch backend")
+    _embed_model = SentenceTransformer(model_name)
+    return _embed_model
 
 
 def embed(text: str) -> bytes | None:
@@ -162,6 +202,51 @@ def embed(text: str) -> bytes | None:
         return None
     vec = model.encode(text, normalize_embeddings=True)
     return vec.astype("float32").tobytes()
+
+
+# Query-embedding cache: repeated searches skip the model load entirely
+# (agents re-run the same queries a lot). Novel queries still pay the load.
+QUERY_CACHE_MAX = 500    # rows before eviction kicks in
+QUERY_CACHE_EVICT = 100  # oldest rows dropped per eviction
+
+
+def _query_cache_get(conn: sqlite3.Connection, qhash: str) -> bytes | None:
+    """Cached query vector or None. Missing table / read errors → None."""
+    try:
+        r = conn.execute(
+            "SELECT embedding FROM query_cache WHERE qhash = ?", (qhash,)
+        ).fetchone()
+        return r["embedding"] if r else None
+    except sqlite3.OperationalError:
+        return None  # table not created yet — first cacheable search makes it
+
+
+def _query_cache_put(conn: sqlite3.Connection, qhash: str, blob: bytes) -> None:
+    """Insert (lazily creating the table), evict oldest when over cap.
+    Best-effort: a locked/read-only DB must never break search itself."""
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_cache (
+                qhash      TEXT PRIMARY KEY,
+                embedding  BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO query_cache(qhash, embedding) VALUES (?, ?)",
+            (qhash, blob),
+        )
+        n = conn.execute("SELECT COUNT(*) AS n FROM query_cache").fetchone()["n"]
+        if n > QUERY_CACHE_MAX:
+            conn.execute(f"""
+                DELETE FROM query_cache WHERE qhash IN (
+                    SELECT qhash FROM query_cache
+                    ORDER BY created_at ASC, rowid ASC LIMIT {QUERY_CACHE_EVICT}
+                )
+            """)
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        _warn(f"query_cache write skipped ({e})")
 
 
 def _split_chunks(content: str) -> list[str]:
@@ -199,6 +284,10 @@ def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: 
     anything past the first ~90 words (and every `update --append`) invisible
     to semantic search. Chunking fixes that. Falls back to the legacy
     single-vector memory_vectors table if memory_chunks doesn't exist yet.
+
+    Does NOT commit — the caller owns the transaction, so the memory row and
+    its chunks land atomically (a crash between two separate commits used to
+    leave memories silently unsearchable; `brain doctor` finds survivors).
     """
     model = get_embedder()
     if model is None or not _vec_loaded:
@@ -214,10 +303,9 @@ def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: 
                 "INSERT INTO memory_chunks(rowid, memory_id, embedding) VALUES (?, ?, ?)",
                 (base + i, memory_id, v.astype("float32").tobytes()),
             )
-        conn.commit()
         return True
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as e:
+        _warn(f"memory_chunks write failed ({e}); trying legacy memory_vectors")
     # Legacy fallback (pre-migration DB): single vector, L2 table.
     vec = embed(f"{title}\n{content}")
     if vec is None:
@@ -227,10 +315,28 @@ def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: 
             "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
             (memory_id, vec),
         )
-        conn.commit()
         return True
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        _warn(f"memory_vectors write failed: {e}")
         return False
+
+
+def _embed_in_txn(conn, cursor, memory_id: int, title: str, content: str, uid: str) -> None:
+    """Embed inside the caller's OPEN transaction (savepoint-guarded).
+
+    Atomicity: memory row + chunks commit together — no crash window where a
+    committed memory has no vectors. Resilience: an embedding exception rolls
+    back only the savepoint, so the save itself still commits (FTS-only mode).
+    """
+    cursor.execute("SAVEPOINT embed")
+    try:
+        embed_memory(conn, memory_id, title, content)
+        cursor.execute("RELEASE SAVEPOINT embed")
+    except Exception as e:
+        cursor.execute("ROLLBACK TO SAVEPOINT embed")
+        cursor.execute("RELEASE SAVEPOINT embed")
+        print(f"⚠ embedding failed for {uid} ({e}); saved FTS-only — `brain doctor --fix` repairs",
+              file=sys.stderr)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -303,11 +409,11 @@ def cmd_save(args) -> int:
     # Audit trail: record creation.
     log_alteration(conn, uid, "create", delta=title, reason=None)
 
-    conn.commit()
-
-    # Embedding (after commit so save still succeeds if model fails).
+    # Embed in the SAME transaction, then one commit (see _embed_in_txn).
     if not args.no_embed and _vec_loaded:
-        embed_memory(conn, memory_id, title, content)
+        _embed_in_txn(conn, cursor, memory_id, title, content, uid)
+
+    conn.commit()
 
     print(uid)
     return 0
@@ -328,16 +434,31 @@ def _build_filters(conn: sqlite3.Connection, args) -> tuple[str, list]:
     return sql, params
 
 
-def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: bool) -> None:
+def _explain_line(e: dict) -> str:
+    """One compact human line: ranks, best-chunk sim, rrf parts, bonuses."""
+    fts = f"#{e['fts_rank'] + 1}" if e["fts_rank"] is not None else "-"
+    sem = f"#{e['sem_rank'] + 1}" if e["sem_rank"] is not None else "-"
+    sim = f"{e['sim']:.3f}" if e["sim"] is not None else "-"
+    return (f"fts={fts} sem={sem} sim={sim} "
+            f"rrf={e['rrf_fts']:.3f}+{e['rrf_sem']:.3f} "
+            f"rec=+{e['recency_bonus']:.3f} acc=+{e['access_bonus']:.3f} "
+            f"= {e['final']:.3f}")
+
+
+def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: bool,
+                   explain: dict[int, dict] | None = None) -> None:
     if as_json:
         out = []
         for score, r in top:
-            out.append({
+            d = {
                 "uid": r["uid"], "type": r["type"], "title": r["title"],
                 "snippet": (r["content"] or "")[:300],
                 "project": r["project"], "score": round(score, 3),
                 "created_at": r["created_at"],
-            })
+            }
+            if explain is not None and r["id"] in explain:
+                d["explain"] = explain[r["id"]]
+            out.append(d)
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
         print(f"\n{len(top)} hit(s) for: {query}\n")
@@ -350,7 +471,10 @@ def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: boo
             print(f"[{r['type']:8}] {r['title']}{project}")
             if snippet:
                 print(f"           {snippet}{'…' if len(r['content'] or '') > 150 else ''}")
-            print(f"           {date} · {r['uid']} · score={score:.2f}{tag_str}\n")
+            print(f"           {date} · {r['uid']} · score={score:.2f}{tag_str}")
+            if explain is not None and r["id"] in explain:
+                print(f"           ↳ {_explain_line(explain[r['id']])}")
+            print()
 
 
 def cmd_search(args) -> int:
@@ -361,6 +485,7 @@ def cmd_search(args) -> int:
     three normalization bugs buried good hits). Recency/access are small
     additive tiebreakers, never multiplicative gates.
     """
+    t_total = time.perf_counter()
     conn = connect(load_vec=True)
     cursor = conn.cursor()
 
@@ -390,6 +515,7 @@ def cmd_search(args) -> int:
     words = [w.replace('"', "") for w in query.split()]
     fts_terms = " OR ".join(f'"{w}"' for w in words if len(w) > 1)
     if fts_terms:
+        t_fts = time.perf_counter()
         try:
             fts_ids = [r["id"] for r in cursor.execute(f"""
                 SELECT m.id AS id
@@ -399,14 +525,28 @@ def cmd_search(args) -> int:
                 ORDER BY bm25(memories_fts, 4.0, 1.0, 3.0, 2.0, 1.0)
                 LIMIT ?
             """, (fts_terms, *filter_params, pool))]
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as e:
+            _warn(f"FTS query failed ({e}); keyword side skipped")
+        _timing("fts query", t_fts)
 
     # 2. Semantic — chunked KNN (cosine), best chunk per memory. Oversampled
     #    because several chunks can belong to one memory and filters apply after.
     sem_pairs: list[tuple[int, float]] = []
     if _vec_loaded and not args.no_semantic:
-        qvec = embed(query)
+        # Query-embedding cache first: a hit means the model is never even
+        # lazy-loaded — repeat queries go straight to KNN.
+        qhash = hashlib.sha256(query.encode()).hexdigest()
+        t_cache = time.perf_counter()
+        qvec = _query_cache_get(conn, qhash)
+        _timing("query cache " + ("hit" if qvec is not None else "miss"), t_cache)
+        if qvec is None:
+            t_model = time.perf_counter()
+            get_embedder()  # idempotent — surface the lazy model-load cost alone
+            _timing("model load", t_model)
+            qvec = embed(query)
+            if qvec is not None:
+                _query_cache_put(conn, qhash, qvec)
+        t_knn = time.perf_counter()
         if qvec is not None:
             k = pool * (4 if filter_sql else 2)
             best: dict[int, float] = {}
@@ -419,7 +559,8 @@ def cmd_search(args) -> int:
                     sim = 1.0 - r["distance"]  # cosine distance → similarity
                     if sim > best.get(r["id"], -1.0):
                         best[r["id"]] = sim
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                _warn(f"memory_chunks KNN failed ({e}); trying legacy memory_vectors")
                 # Legacy single-vector table: L2 over normalized vecs → cos = 1 - d²/2.
                 try:
                     for r in cursor.execute("""
@@ -428,9 +569,10 @@ def cmd_search(args) -> int:
                         WHERE embedding MATCH ? AND k = ?
                     """, (qvec, k)):
                         best[r["id"]] = 1.0 - (r["distance"] ** 2) / 2.0
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as e2:
+                    _warn(f"memory_vectors KNN failed ({e2}); semantic side skipped")
             sem_pairs = sorted(best.items(), key=lambda x: x[1], reverse=True)
+        _timing("knn query", t_knn)
 
     candidate_ids = set(fts_ids) | {mid for mid, _ in sem_pairs}
     if not candidate_ids:
@@ -455,30 +597,42 @@ def cmd_search(args) -> int:
 
     # 3. RRF fusion, normalized so rank-1 in both lists ≈ 1.0, then small
     #    additive recency/access bonuses (tiebreakers, capped).
+    t_fusion = time.perf_counter()
+    sims = dict(sem_pairs)  # best-chunk cosine sim per memory (for --explain)
+    explain: dict[int, dict] | None = {} if getattr(args, "explain", False) else None
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     full = 2.0 / (RRF_K + 1)
     scored = []
     for mid, r in by_id.items():
-        rrf = 0.0
-        if mid in fts_rank:
-            rrf += 1.0 / (RRF_K + fts_rank[mid] + 1)
-        if mid in sem_rank:
-            rrf += 1.0 / (RRF_K + sem_rank[mid] + 1)
-        score = rrf / full
+        rrf_fts = 1.0 / (RRF_K + fts_rank[mid] + 1) / full if mid in fts_rank else 0.0
+        rrf_sem = 1.0 / (RRF_K + sem_rank[mid] + 1) / full if mid in sem_rank else 0.0
         try:
             age_days = (now - datetime.fromisoformat(str(r["created_at"] or "").split(".")[0])).days
         except (TypeError, ValueError):
             age_days = 9999
-        score += 0.05 * math.exp(-max(age_days, 0) / 365.0)
-        score += min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
+        recency = 0.05 * math.exp(-max(age_days, 0) / 365.0)
+        access = min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
+        score = rrf_fts + rrf_sem + recency + access
+        if explain is not None:
+            explain[mid] = {
+                "fts_rank": fts_rank.get(mid),
+                "sem_rank": sem_rank.get(mid),
+                "sim": round(sims[mid], 4) if mid in sims else None,
+                "rrf_fts": round(rrf_fts, 4), "rrf_sem": round(rrf_sem, 4),
+                "rrf": round(rrf_fts + rrf_sem, 4),
+                "recency_bonus": round(recency, 4), "access_bonus": round(access, 4),
+                "final": round(score, 4),
+            }
         scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:limit]
+    _timing("fusion", t_fusion)
+    _timing("total", t_total)
 
     # access_count is bumped on `brain get` only — search must not reinforce
     # its own ranking (rich-get-richer loop on frequently-surfaced junk).
-    _print_results(top, conn, query, args.json)
+    _print_results(top, conn, query, args.json, explain=explain)
     return 0
 
 
@@ -529,7 +683,7 @@ def cmd_link(args) -> int:
         print(f"linked {args.src} --[{args.kind}]--> {args.dst}")
         return 0
     except sqlite3.IntegrityError:
-        return _err(f"link already exists")
+        return _err("link already exists")
 
 
 def cmd_delete(args) -> int:
@@ -614,11 +768,12 @@ def cmd_update(args) -> int:
     )
 
     log_alteration(conn, args.uid, kind, delta=delta, reason=args.reason)
-    conn.commit()
 
-    # Re-embed (after commit so the update still succeeds if the model is absent).
+    # Re-embed in the SAME transaction, then one commit (see _embed_in_txn).
     if _vec_loaded:
-        embed_memory(conn, memory_id, title, new_content)
+        _embed_in_txn(conn, cursor, memory_id, title, new_content, args.uid)
+
+    conn.commit()
 
     print(args.uid)
     return 0
@@ -673,21 +828,22 @@ def cmd_stats(args) -> int:
         embed_count = conn.execute(
             "SELECT COUNT(DISTINCT memory_id) AS n FROM memory_chunks"
         ).fetchone()["n"]
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        _warn(f"memory_chunks count failed ({e}); trying legacy memory_vectors")
         try:
             embed_count = conn.execute("SELECT COUNT(*) AS n FROM memory_vectors").fetchone()["n"]
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as e2:
+            _warn(f"memory_vectors count failed: {e2}")
     schema_v = conn.execute("SELECT value FROM stats WHERE key = 'brain_schema_version'").fetchone()
 
     print(f"\nbrain v{schema_v['value'] if schema_v else '?'}")
     print(f"  active:    {total}")
     print(f"  deleted:   {deleted}")
     print(f"  embedded:  {embed_count}/{total}")
-    print(f"\nby type:")
+    print("\nby type:")
     for r in by_type:
         print(f"  {r['t']:12} {r['n']}")
-    print(f"\ntop projects:")
+    print("\ntop projects:")
     for r in by_proj:
         print(f"  {r['project']:30} {r['n']}")
     return 0
@@ -739,9 +895,146 @@ def cmd_reindex(args) -> int:
     print(f"→ embedding {len(rows)} memories (chunked)…")
     for i, r in enumerate(rows, 1):
         embed_memory(conn, r["id"], r["title"] or "", r["content"] or "")
+        conn.commit()  # embed_memory no longer commits; keep reindex incremental
         if i % 50 == 0 or i == len(rows):
             print(f"  {i}/{len(rows)}")
     print("✓ reindex complete")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """Index health check: missing vectors, orphans, FTS corruption, WAL.
+
+    Exists because the pre-atomic save flow committed the memory row and its
+    chunk vectors separately — a crash in between left memories silently
+    invisible to semantic search (13 found in prod). --fix re-embeds missing
+    vectors, deletes orphan rows, and rebuilds FTS if its check fails.
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    problems = 0
+
+    def table_exists(name: str) -> bool:
+        return cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone() is not None
+
+    active = {r["id"] for r in cursor.execute(
+        "SELECT id FROM memories WHERE deleted_at IS NULL")}
+    has_chunks = _vec_loaded and table_exists("memory_chunks")
+    has_vectors = _vec_loaded and table_exists("memory_vectors")
+    chunked: set[int] = set()
+    if has_chunks:
+        chunked = {r[0] for r in cursor.execute("SELECT DISTINCT memory_id FROM memory_chunks")}
+
+    # (a) active memories with zero chunk rows → invisible to semantic search.
+    missing: list[int] = []
+    if has_chunks:
+        missing = sorted(active - chunked)
+        if missing:
+            problems += len(missing)
+            print(f"✗ {len(missing)} active memories have no chunk vectors (semantic-invisible)")
+        else:
+            print(f"✓ vectors: all {len(active)} active memories have chunks")
+    else:
+        print("- vectors: check skipped (sqlite-vec or memory_chunks unavailable)")
+
+    # (b) orphan chunk/vector rows — memory deleted or missing. Harmless to
+    #     results (search re-filters) but orphan chunks waste KNN slots.
+    #     Legacy memory_vectors orphans only matter when the legacy table is
+    #     actually read (no memory_chunks) — otherwise informational, like (d).
+    orphan_chunks: list[int] = []
+    orphan_vectors: list[int] = []
+    if has_chunks:
+        orphan_chunks = [r["rowid"] for r in cursor.execute(
+            "SELECT rowid, memory_id FROM memory_chunks") if r["memory_id"] not in active]
+    if has_vectors:
+        orphan_vectors = [r["memory_id"] for r in cursor.execute(
+            "SELECT memory_id FROM memory_vectors") if r["memory_id"] not in active]
+    if orphan_chunks or (orphan_vectors and not has_chunks):
+        problems += len(orphan_chunks) + (0 if has_chunks else len(orphan_vectors))
+        print(f"✗ orphans: {len(orphan_chunks)} chunk rows, "
+              f"{len(orphan_vectors)} legacy vector rows point at deleted/missing memories")
+    elif orphan_vectors:
+        print(f"i orphans: {len(orphan_vectors)} legacy vector rows point at "
+              "deleted/missing memories (never read while chunks exist; --fix prunes)")
+    elif has_chunks or has_vectors:
+        print("✓ orphans: none")
+
+    # (c) FTS external-content integrity (rank=1 verifies against memories).
+    fts_ok = True
+    try:
+        conn.execute("INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)")
+        print("✓ FTS: index consistent with memories")
+    except sqlite3.DatabaseError as e:
+        fts_ok = False
+        problems += 1
+        print(f"✗ FTS: integrity check failed ({e})")
+
+    # (d) stale legacy vectors shadowed by chunks — informational only.
+    if has_vectors and chunked:
+        stale = sum(1 for r in cursor.execute("SELECT memory_id FROM memory_vectors")
+                    if r["memory_id"] in chunked)
+        if stale:
+            print(f"i legacy: {stale} memory_vectors rows shadowed by chunks (harmless, never read)")
+
+    # (e) journal mode + schema version.
+    mode = cursor.execute("PRAGMA journal_mode").fetchone()[0]
+    try:
+        sv = cursor.execute(
+            "SELECT value FROM stats WHERE key = 'brain_schema_version'").fetchone()
+        version = sv["value"] if sv else "?"
+    except sqlite3.OperationalError as e:
+        _warn(f"stats table missing: {e}")
+        version = "?"
+    print(f"i journal_mode={mode} schema_version={version}")
+
+    if not args.fix:
+        if problems:
+            print(f"\n{problems} problem(s) found — run `brain doctor --fix`")
+            return 1
+        print("\nhealthy")
+        return 0
+
+    # ── --fix ────────────────────────────────────────────────────────────
+    unfixed = 0
+    if orphan_chunks:
+        for rid in orphan_chunks:
+            cursor.execute("DELETE FROM memory_chunks WHERE rowid = ?", (rid,))
+        conn.commit()
+        print(f"→ deleted {len(orphan_chunks)} orphan chunk rows")
+    if orphan_vectors:
+        for mid in orphan_vectors:
+            cursor.execute("DELETE FROM memory_vectors WHERE memory_id = ?", (mid,))
+        conn.commit()
+        print(f"→ deleted {len(orphan_vectors)} orphan vector rows")
+    if missing:
+        if get_embedder() is None:
+            unfixed += len(missing)
+            print("⚠ cannot re-embed: sentence-transformers unavailable (FTS-only mode)")
+        else:
+            ok = 0
+            for mid in missing:
+                r = cursor.execute(
+                    "SELECT title, content FROM memories WHERE id = ?", (mid,)).fetchone()
+                if r and embed_memory(conn, mid, r["title"] or "", r["content"] or ""):
+                    conn.commit()
+                    ok += 1
+                else:
+                    unfixed += 1
+            print(f"→ re-embedded {ok}/{len(missing)} missing memories")
+    if not fts_ok:
+        try:
+            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            conn.commit()
+            print("→ FTS index rebuilt")
+        except sqlite3.DatabaseError as e:
+            unfixed += 1
+            print(f"✗ FTS rebuild failed: {e}")
+    if unfixed:
+        print(f"\n{unfixed} problem(s) NOT fixed")
+        return 1
+    print("\nall fixable problems repaired")
     return 0
 
 
@@ -827,6 +1120,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--since-days", type=int, help="only memories from last N days")
     s.add_argument("--no-semantic", action="store_true")
+    s.add_argument("--explain", action="store_true", help="show per-result score decomposition")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
 
@@ -880,6 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("reindex", help="Backfill chunked embeddings for memories that lack them")
     s.add_argument("--full", action="store_true", help="re-embed ALL memories, not just missing ones")
     s.set_defaults(func=cmd_reindex)
+
+    # doctor
+    s = sub.add_parser("doctor", help="Check index health (missing vectors, orphans, FTS)")
+    s.add_argument("--fix", action="store_true",
+                   help="re-embed missing, delete orphans, rebuild FTS if corrupt")
+    s.set_defaults(func=cmd_doctor)
 
     # migrate
     s = sub.add_parser("migrate", help="Apply v3 schema migration")
