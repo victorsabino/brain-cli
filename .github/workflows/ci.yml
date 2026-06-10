@@ -1,0 +1,34 @@
+# FTS-only CI by design: no sentence-transformers (~470MB torch stack) — the
+# CLI must fully work without it, and tests marked requires_model auto-skip.
+# Relevance is still gated: eval.py runs the synthetic golden set keyword-only.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (FTS-only — no ML stack)
+        run: pip install sqlite-vec pytest ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        run: python -m pytest tests/ -q
+
+      - name: Search relevance gate (synthetic fixture, keyword-only)
+        run: |
+          python tests/fixtures/make_fixture.py /tmp/fixture.db --golden-out /tmp/golden_synthetic.jsonl
+          python scripts/eval.py --golden /tmp/golden_synthetic.jsonl \
+            --db /tmp/fixture.db --no-semantic --min-recall5 0.9
