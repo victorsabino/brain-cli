@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 import hashlib
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB = Path.home() / "brain.db"
+DB = Path(os.environ.get("BRAIN_DB") or (Path.home() / "brain.db"))
 HERE = Path(__file__).resolve().parent
 
 # All ALTER TABLE statements run individually with duplicate-tolerance.
@@ -245,10 +246,21 @@ def setup_vec_extension(conn: sqlite3.Connection) -> bool:
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
+        # Legacy single-vector table (kept for rollback; no longer written to
+        # once memory_chunks exists).
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
                 memory_id INTEGER PRIMARY KEY,
                 embedding FLOAT[384]
+            )
+        """)
+        # Chunked embeddings, cosine distance. One row per ~500-char chunk;
+        # rowid = memory_id * 64 + chunk_index, memory_id is a filterable
+        # metadata column returned alongside KNN distances.
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks USING vec0(
+                memory_id INTEGER,
+                embedding FLOAT[384] distance_metric=cosine
             )
         """)
         conn.commit()
@@ -256,6 +268,48 @@ def setup_vec_extension(conn: sqlite3.Connection) -> bool:
     except Exception as e:
         print(f"    ⚠ vec0 setup failed: {e}")
         return False
+
+
+def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
+    """Recreate memories_fts with porter stemming (migration/migrations match).
+
+    External-content FTS — dropping and rebuilding loses nothing; content
+    lives in memories. Triggers are recreated identically. Idempotent: skips
+    when the table already uses porter.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'memories_fts' AND type = 'table'"
+    ).fetchone()
+    if row and "porter" in (row[0] or ""):
+        return False
+    conn.executescript("""
+        DROP TRIGGER IF EXISTS memories_ai;
+        DROP TRIGGER IF EXISTS memories_au;
+        DROP TRIGGER IF EXISTS memories_ad;
+        DROP TABLE IF EXISTS memories_fts;
+        CREATE VIRTUAL TABLE memories_fts USING fts5(
+          title, content, tags, project, type,
+          content=memories, content_rowid=rowid,
+          tokenize='porter unicode61'
+        );
+        CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+          INSERT INTO memories_fts(rowid, title, content, tags, project, type)
+          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type);
+        END;
+        CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type)
+          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type);
+          INSERT INTO memories_fts(rowid, title, content, tags, project, type)
+          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type);
+        END;
+        CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type)
+          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type);
+        END;
+        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+    """)
+    conn.commit()
+    return True
 
 
 def mark_schema_version(conn: sqlite3.Connection) -> None:
@@ -300,9 +354,15 @@ def main() -> int:
     n = backfill_task_meta(conn)
     print(f"    {n} tasks materialized")
 
-    print("  • setting up sqlite-vec memory_vectors")
+    print("  • setting up sqlite-vec memory_vectors + memory_chunks")
     if setup_vec_extension(conn):
         print("    ✓ ready (run `brain reindex` to populate)")
+
+    print("  • rebuilding memories_fts with porter stemming")
+    if rebuild_fts_porter(conn):
+        print("    ✓ rebuilt (porter unicode61)")
+    else:
+        print("    already porter — skipped")
 
     mark_schema_version(conn)
     print("\n✓ schema v3 applied")

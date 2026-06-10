@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -38,6 +39,12 @@ DB = Path(os.environ.get("BRAIN_DB") or (Path.home() / "brain.db"))
 
 CANONICAL_TYPES = {"learning", "decision", "bug", "snippet", "note", "task", "person", "project"}
 LINK_KINDS = {"cites", "caused_by", "fixed_by", "superseded_by", "blocks", "related_to", "duplicate_of"}
+
+# Search/embedding tuning.
+RRF_K = 60          # reciprocal-rank-fusion constant (standard)
+CHUNK_CAP = 64      # max chunks per memory; chunk rowid = memory_id * CHUNK_CAP + idx
+CHUNK_TARGET = 500  # soft chunk size (chars) — fits the 128-token embed window
+CHUNK_HARD = 900    # hard split for pathological paragraphs
 
 # Lazy globals.
 _alias_cache: dict[str, str] | None = None
@@ -157,6 +164,75 @@ def embed(text: str) -> bytes | None:
     return vec.astype("float32").tobytes()
 
 
+def _split_chunks(content: str) -> list[str]:
+    """Split content into ~CHUNK_TARGET-char pieces on paragraph boundaries."""
+    paras: list[str] = []
+    for p in re.split(r"\n\s*\n", content or ""):
+        p = p.strip()
+        while len(p) > CHUNK_HARD:
+            paras.append(p[:CHUNK_HARD])
+            p = p[CHUNK_HARD:].strip()
+        if p:
+            paras.append(p)
+    chunks: list[str] = []
+    cur = ""
+    for p in paras:
+        if cur and len(cur) + len(p) + 2 > CHUNK_TARGET:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = f"{cur}\n\n{p}" if cur else p
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+
+
+def chunk_texts(title: str, content: str) -> list[str]:
+    """Embeddable texts: title prepended to every chunk so each stays topical."""
+    return [f"{title}\n{c}" if c else title for c in _split_chunks(content)][:CHUNK_CAP]
+
+
+def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: str) -> bool:
+    """Write chunked embeddings into memory_chunks (cosine vec0).
+
+    The model's effective window is ~128 tokens, so one vector per memory makes
+    anything past the first ~90 words (and every `update --append`) invisible
+    to semantic search. Chunking fixes that. Falls back to the legacy
+    single-vector memory_vectors table if memory_chunks doesn't exist yet.
+    """
+    model = get_embedder()
+    if model is None or not _vec_loaded:
+        return False
+    texts = chunk_texts(title, content)
+    try:
+        vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        base = memory_id * CHUNK_CAP
+        for i in range(CHUNK_CAP):
+            conn.execute("DELETE FROM memory_chunks WHERE rowid = ?", (base + i,))
+        for i, v in enumerate(vecs):
+            conn.execute(
+                "INSERT INTO memory_chunks(rowid, memory_id, embedding) VALUES (?, ?, ?)",
+                (base + i, memory_id, v.astype("float32").tobytes()),
+            )
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        pass
+    # Legacy fallback (pre-migration DB): single vector, L2 table.
+    vec = embed(f"{title}\n{content}")
+    if vec is None:
+        return False
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
+            (memory_id, vec),
+        )
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Commands
 # ────────────────────────────────────────────────────────────────────────────
@@ -231,122 +307,29 @@ def cmd_save(args) -> int:
 
     # Embedding (after commit so save still succeeds if model fails).
     if not args.no_embed and _vec_loaded:
-        vec = embed(f"{title}\n{content}")
-        if vec is not None:
-            try:
-                cursor.execute(
-                    "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
-                    (memory_id, vec),
-                )
-                conn.commit()
-            except sqlite3.OperationalError:
-                pass
+        embed_memory(conn, memory_id, title, content)
 
     print(uid)
     return 0
 
 
-def cmd_search(args) -> int:
-    conn = connect(load_vec=True)
-    cursor = conn.cursor()
-
-    query = args.query
-    limit = args.limit
-
-    # 1. FTS5 keyword (always available).
-    fts_terms = " OR ".join(f'"{w}"' for w in query.split() if len(w) > 1)
-    fts_hits: dict[int, float] = {}
-    if fts_terms:
-        try:
-            for r in cursor.execute("""
-                SELECT m.rowid AS id, bm25(memories_fts) AS score
-                FROM memories_fts
-                JOIN memories m ON m.rowid = memories_fts.rowid
-                WHERE memories_fts MATCH ? AND m.deleted_at IS NULL
-                LIMIT ?
-            """, (fts_terms, limit * 3)):
-                # bm25: lower = better. Invert so higher = better, normalize ~ [0..1].
-                fts_hits[r["id"]] = 1.0 / (1.0 + max(r["score"], 0))
-        except sqlite3.OperationalError:
-            pass
-
-    # 2. Semantic (only if vec0 loaded and embedder available).
-    sem_hits: dict[int, float] = {}
-    if _vec_loaded and not args.no_semantic:
-        qvec = embed(query)
-        if qvec is not None:
-            try:
-                for r in cursor.execute("""
-                    SELECT memory_id AS id, distance
-                    FROM memory_vectors
-                    WHERE embedding MATCH ? AND k = ?
-                """, (qvec, limit * 3)):
-                    sem_hits[r["id"]] = max(0.0, 1.0 - r["distance"])
-            except sqlite3.OperationalError:
-                pass
-
-    # 3. Merge scores with weights + recency + access boosts.
-    candidate_ids = set(fts_hits) | set(sem_hits)
-    if not candidate_ids:
-        if args.json:
-            print("[]")
-        else:
-            print(f"No results for: {query}")
-        return 0
-
-    # Apply filters in SQL for speed.
-    placeholders = ",".join("?" * len(candidate_ids))
-    rows_sql = f"""
-        SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
-               m.created_at, m.last_accessed_at, m.access_count
-        FROM memories m
-        WHERE m.id IN ({placeholders}) AND m.deleted_at IS NULL
-    """
-    params: list = list(candidate_ids)
-    if args.type:
-        rows_sql += f" AND m.canonical_type IN ({','.join('?'*len(args.type))})"
+def _build_filters(conn: sqlite3.Connection, args) -> tuple[str, list]:
+    """Shared --type/--project/--since-days filter SQL (alias `m`)."""
+    sql, params = "", []
+    if getattr(args, "type", None):
+        sql += f" AND m.canonical_type IN ({','.join('?' * len(args.type))})"
         params.extend(canonical_type(conn, t) for t in args.type)
-    if args.project:
-        rows_sql += " AND m.project = ?"
+    if getattr(args, "project", None):
+        sql += " AND m.project = ?"
         params.append(args.project)
-    if args.since_days:
-        rows_sql += " AND m.created_at > datetime('now', ?)"
+    if getattr(args, "since_days", None):
+        sql += " AND m.created_at > datetime('now', ?)"
         params.append(f"-{args.since_days} days")
+    return sql, params
 
-    rows = cursor.execute(rows_sql, params).fetchall()
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    scored = []
-    for r in rows:
-        fts_score = fts_hits.get(r["id"], 0.0)
-        sem_score = sem_hits.get(r["id"], 0.0)
-        # Combined score: 60% semantic, 40% keyword.
-        base = 0.6 * sem_score + 0.4 * fts_score if sem_score else fts_score
-        # Recency: half-life 365 days.
-        try:
-            age_days = (now - datetime.fromisoformat((r["created_at"] or "").split(".")[0])).days
-        except (TypeError, ValueError):
-            age_days = 9999
-        recency = math.exp(-max(age_days, 0) / 365.0)
-        # Access boost: log(count+1).
-        access = 1.0 + math.log1p(r["access_count"] or 0)
-        final_score = base * recency * access
-        scored.append((final_score, r))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:limit]
-
-    # Update access_count + last_accessed_at on the hits.
-    if top:
-        ids = [r[1]["id"] for r in top]
-        cursor.execute(f"""
-            UPDATE memories
-            SET access_count = access_count + 1, last_accessed_at = datetime('now')
-            WHERE id IN ({','.join('?'*len(ids))})
-        """, ids)
-        conn.commit()
-
-    if args.json:
+def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: bool) -> None:
+    if as_json:
         out = []
         for score, r in top:
             out.append({
@@ -368,6 +351,134 @@ def cmd_search(args) -> int:
             if snippet:
                 print(f"           {snippet}{'…' if len(r['content'] or '') > 150 else ''}")
             print(f"           {date} · {r['uid']} · score={score:.2f}{tag_str}\n")
+
+
+def cmd_search(args) -> int:
+    """Hybrid search: ranked FTS5 + chunked semantic KNN, fused with RRF.
+
+    RRF is scale-free — it merges by *rank*, so bm25 magnitudes and cosine
+    similarities never have to share a scale (the old weighted-sum did, and
+    three normalization bugs buried good hits). Recency/access are small
+    additive tiebreakers, never multiplicative gates.
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+
+    query = (args.query or "").strip()
+    limit = args.limit
+    filter_sql, filter_params = _build_filters(conn, args)
+
+    # Empty query → plain filtered listing (newest first). Makes the
+    # documented `brain search "" --type=task` pattern actually work.
+    if not query:
+        rows = cursor.execute(f"""
+            SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
+                   m.created_at, m.access_count
+            FROM memories m
+            WHERE m.deleted_at IS NULL{filter_sql}
+            ORDER BY m.updated_at DESC
+            LIMIT ?
+        """, (*filter_params, limit)).fetchall()
+        _print_results([(0.0, r) for r in rows], conn, "(listing)", args.json)
+        return 0
+
+    pool = max(50, limit * 5)
+
+    # 1. FTS5 keyword — best-first (bm25 ASC), title/tags weighted above body.
+    #    Filters applied BEFORE the limit so filtered searches don't starve.
+    fts_ids: list[int] = []
+    words = [w.replace('"', "") for w in query.split()]
+    fts_terms = " OR ".join(f'"{w}"' for w in words if len(w) > 1)
+    if fts_terms:
+        try:
+            fts_ids = [r["id"] for r in cursor.execute(f"""
+                SELECT m.id AS id
+                FROM memories_fts
+                JOIN memories m ON m.rowid = memories_fts.rowid
+                WHERE memories_fts MATCH ? AND m.deleted_at IS NULL{filter_sql}
+                ORDER BY bm25(memories_fts, 4.0, 1.0, 3.0, 2.0, 1.0)
+                LIMIT ?
+            """, (fts_terms, *filter_params, pool))]
+        except sqlite3.OperationalError:
+            pass
+
+    # 2. Semantic — chunked KNN (cosine), best chunk per memory. Oversampled
+    #    because several chunks can belong to one memory and filters apply after.
+    sem_pairs: list[tuple[int, float]] = []
+    if _vec_loaded and not args.no_semantic:
+        qvec = embed(query)
+        if qvec is not None:
+            k = pool * (4 if filter_sql else 2)
+            best: dict[int, float] = {}
+            try:
+                for r in cursor.execute("""
+                    SELECT memory_id AS id, distance
+                    FROM memory_chunks
+                    WHERE embedding MATCH ? AND k = ?
+                """, (qvec, k)):
+                    sim = 1.0 - r["distance"]  # cosine distance → similarity
+                    if sim > best.get(r["id"], -1.0):
+                        best[r["id"]] = sim
+            except sqlite3.OperationalError:
+                # Legacy single-vector table: L2 over normalized vecs → cos = 1 - d²/2.
+                try:
+                    for r in cursor.execute("""
+                        SELECT memory_id AS id, distance
+                        FROM memory_vectors
+                        WHERE embedding MATCH ? AND k = ?
+                    """, (qvec, k)):
+                        best[r["id"]] = 1.0 - (r["distance"] ** 2) / 2.0
+                except sqlite3.OperationalError:
+                    pass
+            sem_pairs = sorted(best.items(), key=lambda x: x[1], reverse=True)
+
+    candidate_ids = set(fts_ids) | {mid for mid, _ in sem_pairs}
+    if not candidate_ids:
+        if args.json:
+            print("[]")
+        else:
+            print(f"No results for: {query}")
+        return 0
+
+    placeholders = ",".join("?" * len(candidate_ids))
+    rows = cursor.execute(f"""
+        SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
+               m.created_at, m.access_count
+        FROM memories m
+        WHERE m.id IN ({placeholders}) AND m.deleted_at IS NULL{filter_sql}
+    """, (*candidate_ids, *filter_params)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    # Ranks among surviving (filter-passing) candidates only.
+    fts_rank = {mid: i for i, mid in enumerate(m for m in fts_ids if m in by_id)}
+    sem_rank = {mid: i for i, mid in enumerate(mid for mid, _ in sem_pairs if mid in by_id)}
+
+    # 3. RRF fusion, normalized so rank-1 in both lists ≈ 1.0, then small
+    #    additive recency/access bonuses (tiebreakers, capped).
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    full = 2.0 / (RRF_K + 1)
+    scored = []
+    for mid, r in by_id.items():
+        rrf = 0.0
+        if mid in fts_rank:
+            rrf += 1.0 / (RRF_K + fts_rank[mid] + 1)
+        if mid in sem_rank:
+            rrf += 1.0 / (RRF_K + sem_rank[mid] + 1)
+        score = rrf / full
+        try:
+            age_days = (now - datetime.fromisoformat(str(r["created_at"] or "").split(".")[0])).days
+        except (TypeError, ValueError):
+            age_days = 9999
+        score += 0.05 * math.exp(-max(age_days, 0) / 365.0)
+        score += min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:limit]
+
+    # access_count is bumped on `brain get` only — search must not reinforce
+    # its own ranking (rich-get-richer loop on frequently-surfaced junk).
+    _print_results(top, conn, query, args.json)
     return 0
 
 
@@ -507,16 +618,7 @@ def cmd_update(args) -> int:
 
     # Re-embed (after commit so the update still succeeds if the model is absent).
     if _vec_loaded:
-        vec = embed(f"{title}\n{new_content}")
-        if vec is not None:
-            try:
-                cursor.execute(
-                    "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
-                    (memory_id, vec),
-                )
-                conn.commit()
-            except sqlite3.OperationalError:
-                pass
+        embed_memory(conn, memory_id, title, new_content)
 
     print(args.uid)
     return 0
@@ -568,9 +670,14 @@ def cmd_stats(args) -> int:
     """).fetchall()
     embed_count = 0
     try:
-        embed_count = conn.execute("SELECT COUNT(*) AS n FROM memory_vectors").fetchone()["n"]
+        embed_count = conn.execute(
+            "SELECT COUNT(DISTINCT memory_id) AS n FROM memory_chunks"
+        ).fetchone()["n"]
     except sqlite3.OperationalError:
-        pass
+        try:
+            embed_count = conn.execute("SELECT COUNT(*) AS n FROM memory_vectors").fetchone()["n"]
+        except sqlite3.OperationalError:
+            pass
     schema_v = conn.execute("SELECT value FROM stats WHERE key = 'brain_schema_version'").fetchone()
 
     print(f"\nbrain v{schema_v['value'] if schema_v else '?'}")
@@ -600,7 +707,11 @@ def cmd_recent(args) -> int:
 
 
 def cmd_reindex(args) -> int:
-    """Backfill embeddings for memories missing them. Heavy — uses sentence-transformers."""
+    """Backfill chunked embeddings. Heavy — uses sentence-transformers.
+
+    Default: only memories with no chunks yet. --full: re-embed everything
+    (use after changing chunking parameters or the model).
+    """
     conn = connect(load_vec=True)
     if not _vec_loaded:
         return _err("sqlite-vec not loaded. Re-run via uv to install: `uv run brain.py reindex`")
@@ -609,25 +720,27 @@ def cmd_reindex(args) -> int:
     if model is None:
         return _err("sentence-transformers not installed. Add it to inline deps and re-run via uv.")
 
-    rows = conn.execute("""
-        SELECT m.id, m.title, m.content
-        FROM memories m
-        LEFT JOIN memory_vectors v ON v.memory_id = m.id
-        WHERE m.deleted_at IS NULL AND v.memory_id IS NULL
-    """).fetchall()
-    print(f"→ embedding {len(rows)} memories…")
-    batch_size = 32
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        texts = [f"{r['title']}\n{r['content'] or ''}" for r in batch]
-        vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        for r, vec in zip(batch, vecs):
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_vectors(memory_id, embedding) VALUES (?, ?)",
-                (r["id"], vec.astype("float32").tobytes()),
-            )
-        conn.commit()
-        print(f"  {min(i + batch_size, len(rows))}/{len(rows)}")
+    # Idempotent — vec extension is loaded, so create the chunk table if absent.
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks USING vec0(
+            memory_id INTEGER,
+            embedding FLOAT[384] distance_metric=cosine
+        )
+    """)
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT id, title, content FROM memories WHERE deleted_at IS NULL"
+    ).fetchall()
+    if not args.full:
+        done = {r[0] for r in conn.execute("SELECT DISTINCT memory_id FROM memory_chunks")}
+        rows = [r for r in rows if r["id"] not in done]
+
+    print(f"→ embedding {len(rows)} memories (chunked)…")
+    for i, r in enumerate(rows, 1):
+        embed_memory(conn, r["id"], r["title"] or "", r["content"] or "")
+        if i % 50 == 0 or i == len(rows):
+            print(f"  {i}/{len(rows)}")
     print("✓ reindex complete")
     return 0
 
@@ -764,7 +877,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_recent)
 
     # reindex
-    s = sub.add_parser("reindex", help="Backfill embeddings for memories that lack them")
+    s = sub.add_parser("reindex", help="Backfill chunked embeddings for memories that lack them")
+    s.add_argument("--full", action="store_true", help="re-embed ALL memories, not just missing ones")
     s.set_defaults(func=cmd_reindex)
 
     # migrate
