@@ -5,6 +5,20 @@ All notable changes to brain-cli are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-06-11
+
+### Added
+- `brain harvest <transcript.jsonl>` — automatic extraction from Claude Code
+  session transcripts: watermark-based incremental parsing (`harvest_state`
+  table, only complete new lines consumed), tool noise stripped in pure
+  Python, one headless `claude -p` call (default haiku) with a REJECT-gated
+  prompt, every candidate routed through the reconcile pipeline (dups and
+  recall-echoes die before storage; ambiguous ones queue to
+  `~/.config/brain/harvest-review.jsonl`). `--dry-run`, `--min-delta`,
+  `--force`, `--model`. Recursion-guarded via `BRAIN_HARVEST=1`.
+- Stop-hook template for fire-and-forget harvesting (throttled, detached) —
+  documented in AGENTS.md.
+
 ## [3.3.0] - 2026-06-11
 
 Memory-lifecycle release (schema v4): the mechanisms that keep a long-running
@@ -33,10 +47,6 @@ invalidation), Letta (offline consolidation), and claude-mem (token burn).
   `context` (falls back to the content head).
 - Schema v4: `invalid_at`, `abstract` columns + `recall_log` table; v4
   features degrade gracefully on pre-v4 DBs until `brain migrate`.
-
-## [Unreleased]
-
-### Added
 - **Query-embedding cache** (`query_cache` table, created lazily): repeated
   search queries reuse their stored 384-dim vector and skip the embedding
   model entirely — the model is not even lazy-loaded on a cache hit
@@ -101,6 +111,8 @@ invalidation), Letta (offline consolidation), and claude-mem (token burn).
   is absent.
 - Single-file design with uv inline script dependencies (PEP 723).
 
+[3.4.0]: https://github.com/victorsabino/brain-cli/releases/tag/v3.4.0
+[3.3.0]: https://github.com/victorsabino/brain-cli/releases/tag/v3.3.0
 [3.2.0]: https://github.com/victorsabino/brain-cli/releases/tag/v3.2.0
 [3.1.0]: https://github.com/victorsabino/brain-cli/releases/tag/v3.1.0
 [3.0.0]: https://github.com/victorsabino/brain-cli/releases/tag/v3.0.0

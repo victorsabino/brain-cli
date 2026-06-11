@@ -35,6 +35,7 @@ brain context "current task" --budget 2000   # prompt-ready block, hard token ca
 brain reconcile --title "..." --content "..."  # ADD/UPDATE/NOOP packet before saving
 brain invalidate <uid> --superseded-by <uid>   # fact no longer true (soft, reversible)
 brain consolidate                              # near-duplicate clusters; --merge to fold
+brain harvest <transcript.jsonl>               # auto-extract memories from agent sessions
 brain link  <src_uid> <dst_uid> <kind>
 brain stats · brain recent 20
 brain reindex     # backfill embeddings
@@ -187,6 +188,14 @@ top complaint class). v4 adds one mechanism against each:
   embedding clusters above `--threshold 0.85`). Read-only report;
   `--merge KEEPER DUP...` folds clusters by invalidating dups as
   superseded — content is never destroyed.
+- **`brain harvest <transcript.jsonl>`** — automatic capture with zero agent
+  cooperation: parses a Claude Code session transcript (watermarked byte
+  offsets — bytes are never reprocessed), one cheap LLM call per session-delta
+  (`claude -p`, haiku by default, REJECT gate in the prompt), and every
+  candidate goes through `reconcile` — so extraction can propose but only
+  hygiene-approved facts get stored. Wire it to a Stop hook (see AGENTS.md)
+  and capture stops depending on agent discipline. Mem0-style auto-capture,
+  minus Mem0's junk problem.
 - **`brain context "<query>" --budget 2000`** — prompt-ready block of L0
   abstracts under a HARD token cap, for session-start / per-prompt
   injection. Pass `--abstract` at save time for a hand-written one-liner;

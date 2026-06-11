@@ -71,43 +71,56 @@ below to the user's agent rules file** — `~/.claude/CLAUDE.md` (Claude Code),
 `.cursorrules` (Cursor), or the project's `AGENTS.md` (Codex and others).
 Show the user the exact block and the target file, get a yes, then append.
 
-**A2 (Claude Code only). Install a Stop hook that triggers a capture pass
-every 5th turn-end** — so learnings get saved even when nobody thinks of it.
-With consent, create `~/.config/brain/hooks/brain-capture.py`:
+**A2 (Claude Code only). Install the automatic harvest Stop hook** — fully
+automatic capture, zero discipline required: on session stops (throttled to
+one per 10 min), a detached `brain harvest` parses the session transcript
+delta (watermarked — bytes never reprocessed), makes ONE cheap `claude -p
+--model haiku` extraction call with a REJECT-gated prompt, and routes every
+candidate through `brain reconcile` (duplicates and recall-echoes are
+discarded before storage; ambiguous candidates queue to
+`~/.config/brain/harvest-review.jsonl`).
+
+With consent, create `~/.config/brain/hooks/brain-harvest-hook.py`:
 
 ```python
 #!/usr/bin/env python3
-"""Every Nth Claude Code stop, ask the agent to do one brain-capture pass."""
-import json, sys
+"""Claude Code Stop hook: fire-and-forget brain harvest on the transcript."""
+import json, os, subprocess, sys, time
 from pathlib import Path
 
-N = 5
-data = json.load(sys.stdin)
-if data.get("stop_hook_active"):          # don't loop on our own block
+THROTTLE_S = 600  # at most one harvest per session per 10 min
+try:
+    data = json.load(sys.stdin)
+except ValueError:
     sys.exit(0)
-counter = Path.home() / ".config/brain/stop_count"
-counter.parent.mkdir(parents=True, exist_ok=True)
-n = int(counter.read_text() or 0) + 1 if counter.exists() else 1
-counter.write_text(str(n))
-if n % N:
+if data.get("stop_hook_active") or os.environ.get("BRAIN_HARVEST") == "1":
+    sys.exit(0)  # BRAIN_HARVEST guard: the extraction call must not re-harvest
+tp = data.get("transcript_path") or ""
+if not tp or not Path(tp).exists():
     sys.exit(0)
-print(json.dumps({
-    "decision": "block",
-    "reason": ("Before finishing: review this conversation for lasting facts "
-               "(root causes, decisions, fixes, patterns). For each, follow the "
-               "brain search-then-merge convention in your rules file, then stop. "
-               "If nothing is worth saving, just stop."),
-}))
+stamps = Path.home() / ".config/brain/harvest-stamps"
+stamps.mkdir(parents=True, exist_ok=True)
+stamp = stamps / (Path(tp).stem + ".t")
+if stamp.exists() and time.time() - stamp.stat().st_mtime < THROTTLE_S:
+    sys.exit(0)
+stamp.touch()
+log = open(Path.home() / ".config/brain/harvest.log", "ab")
+subprocess.Popen([str(Path.home() / "bin" / "brain"), "harvest", tp],
+                 stdout=log, stderr=log, start_new_session=True)
+sys.exit(0)
 ```
 
 Then merge into `~/.claude/settings.json` (show the diff first):
 ```json
 {"hooks": {"Stop": [{"hooks": [{"type": "command",
-  "command": "python3 ~/.config/brain/hooks/brain-capture.py"}]}]}}
+  "command": "python3 ~/.config/brain/hooks/brain-harvest-hook.py",
+  "timeout": 10}]}]}}
 ```
-`chmod +x` the script. Tell the user: every 5th time the agent finishes a
-turn, it gets one nudge to persist what it learned. Change `N` to taste;
-delete the hook entry to disable.
+`chmod +x` the script. Tell the user: it never blocks the session (detached
+child), costs ~one haiku call per 10 min of active work, logs to
+`~/.config/brain/harvest.log`, and deleting the hook entry disables it.
+Periodically review `~/.config/brain/harvest-review.jsonl` for the
+ambiguous candidates harvest wouldn't auto-save.
 
 ### Option B — conventions only
 

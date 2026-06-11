@@ -1016,28 +1016,9 @@ SIM_UPDATE = 0.85          # ≥ this → same topic, merge into the neighbor
 SIM_REVIEW = 0.70          # ≥ this → ambiguous, agent must look
 
 
-def cmd_reconcile(args) -> int:
-    """ADD/UPDATE/NOOP decision packet for a candidate fact (search-then-merge,
-    enforced). The agent calls this INSTEAD of blind `brain save`:
-
-      suggestion=add     → safe to save (use --auto to do it in one step)
-      suggestion=noop    → exact duplicate, or a re-extraction echo of a
-                           memory recalled in the last 24h (Mem0's 808-dup
-                           feedback loop — the guard exists because of it)
-      suggestion=update  → same topic exists: `brain update <uid> --append`
-      suggestion=review  → ambiguous; agent reads neighbors and decides
-                           (update / save / invalidate the old one)
-
-    --auto: applies 'add' (saves, prints uid), exits 2 on 'noop' (like dedup),
-    exits 3 on 'update'/'review' (packet printed — agent must decide).
-    """
-    conn = connect(load_vec=True)
-    cursor = conn.cursor()
-    title = args.title.strip()
-    content = (args.content or "").strip()
-    if not title:
-        return _err("--title is required")
-
+def _reconcile_decide(conn, cursor, title: str, content: str, args) -> dict:
+    """The AUDN decision core: candidate fact → suggestion packet.
+    Shared by `brain reconcile` (agent-facing) and `brain harvest` (automatic)."""
     h = content_hash(title, content)
     flags = _schema_flags(conn)
     invalid_sql = " AND invalid_at IS NULL" if flags["invalid_at"] else ""
@@ -1049,7 +1030,7 @@ def cmd_reconcile(args) -> int:
     filter_sql, filter_params = _build_filters(conn, args)
     top, explain = _hybrid_search(
         conn, cursor, f"{title} {content[:300]}".strip(), 5, filter_sql,
-        filter_params, no_semantic=args.no_semantic, want_explain=True,
+        filter_params, no_semantic=getattr(args, "no_semantic", False), want_explain=True,
     )
     recalled = _recently_recalled(conn)
     neighbors = []
@@ -1082,11 +1063,37 @@ def cmd_reconcile(args) -> int:
     else:
         suggestion, reason, target = "add", "no sufficiently similar memory found", None
 
-    packet = {
+    return {
         "suggestion": suggestion, "reason": reason, "target_uid": target,
-        "candidate": {"title": title, "content_hash": h, "type": args.type},
+        "candidate": {"title": title, "content_hash": h, "type": getattr(args, "type", "note")},
         "neighbors": neighbors,
     }
+
+
+def cmd_reconcile(args) -> int:
+    """ADD/UPDATE/NOOP decision packet for a candidate fact (search-then-merge,
+    enforced). The agent calls this INSTEAD of blind `brain save`:
+
+      suggestion=add     → safe to save (use --auto to do it in one step)
+      suggestion=noop    → exact duplicate, or a re-extraction echo of a
+                           memory recalled in the last 24h (Mem0's 808-dup
+                           feedback loop — the guard exists because of it)
+      suggestion=update  → same topic exists: `brain update <uid> --append`
+      suggestion=review  → ambiguous; agent reads neighbors and decides
+                           (update / save / invalidate the old one)
+
+    --auto: applies 'add' (saves, prints uid), exits 2 on 'noop' (like dedup),
+    exits 3 on 'update'/'review' (packet printed — agent must decide).
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    title = args.title.strip()
+    content = (args.content or "").strip()
+    if not title:
+        return _err("--title is required")
+
+    packet = _reconcile_decide(conn, cursor, title, content, args)
+    suggestion, target = packet["suggestion"], packet["target_uid"]
 
     if args.auto:
         if suggestion == "add":
@@ -1105,6 +1112,211 @@ def cmd_reconcile(args) -> int:
         return 3  # update/review — the agent must decide
 
     print(json.dumps(packet, ensure_ascii=False, indent=2))
+    return 0
+
+
+# ── harvest (automatic extraction from agent transcripts) ───────────────────
+
+HARVEST_MAX_DELTA = 60_000  # chars of conversation per extraction call (newest kept)
+
+HARVEST_PROMPT = """You are a memory-extraction gate for a personal knowledge DB. Below is the
+newest delta of a coding-agent conversation (project hint: {project}).
+
+Extract ONLY facts with lasting value (useful to recall in 1+ months): root
+causes found, decisions made and WHY, bug fixes (symptom + cause + fix),
+durable configs/IDs/paths, hard-won gotchas, ownership facts about people.
+
+REJECT — do not output: transient task state, plans not yet executed,
+restated instructions, tool output noise, file contents, chit-chat,
+secrets/credentials (never copy a secret value anywhere), and anything that
+reads like ALREADY-RECALLED memory (e.g. lines under "Relevant memories
+(brain)" or text citing brain uids) — those are echoes, not new knowledge.
+
+Output a JSON array, NOTHING else. Each item:
+{{"type": "learning|decision|bug|snippet|note",
+  "title": "<concise, searchable, under 100 chars>",
+  "content": "<the fact, self-contained, with its WHY>",
+  "project": "<slug, default {project}>",
+  "tags": "<3-5,comma,separated>",
+  "abstract": "<one informative sentence>"}}
+Output [] if nothing qualifies. Maximum 5 items — pick the most durable.
+
+CONVERSATION DELTA:
+{conversation}"""
+
+
+def ensure_harvest_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS harvest_state (
+            path         TEXT PRIMARY KEY,
+            byte_offset  INTEGER NOT NULL DEFAULT 0,
+            last_run     DATETIME
+        )
+    """)
+
+
+def _transcript_delta(path: Path, offset: int) -> tuple[str, int]:
+    """Clean USER/ASSISTANT text from JSONL bytes past `offset`.
+
+    Only consumes up to the last complete line — a transcript mid-write never
+    corrupts the watermark. Tool calls/results are dropped: facts live in the
+    prose, and tool dumps are exactly the noise Mem0's junk audit drowned in.
+    """
+    size = path.stat().st_size
+    if size <= offset:
+        return "", offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        raw = f.read()
+    cut = raw.rfind(b"\n")
+    if cut < 0:
+        return "", offset  # no complete new line yet
+    raw = raw[:cut + 1]
+    new_offset = offset + len(raw)
+
+    out = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") not in ("user", "assistant"):
+            continue
+        content = (d.get("message") or {}).get("content")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(c.get("text", "") for c in content
+                         if isinstance(c, dict) and c.get("type") == "text")
+        text = "\n".join(t for t in texts if t).strip()
+        if not text or text.startswith("<system-reminder"):
+            continue
+        out.append(f"{'USER' if d['type'] == 'user' else 'ASSISTANT'}: {text}")
+    return "\n\n".join(out), new_offset
+
+
+def _extract_candidates(prompt: str, model: str) -> list[dict] | None:
+    """One headless `claude -p` call → candidate facts. None = call failed
+    (caller must NOT advance the watermark); [] = nothing worth saving."""
+    import subprocess
+    import tempfile
+    env = {**os.environ, "BRAIN_HARVEST": "1"}  # its Stop hook must not re-harvest
+    try:
+        r = subprocess.run(
+            ["claude", "-p", prompt, "--model", model],
+            capture_output=True, text=True, timeout=240,
+            cwd=tempfile.gettempdir(),  # neutral cwd: no project CLAUDE.md pulled in
+            env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _warn(f"claude extraction failed: {e}")
+        return None
+    if r.returncode != 0:
+        _warn(f"claude -p exited {r.returncode}: {(r.stderr or '')[:200]}")
+        return None
+    m = re.search(r"\[.*\]", r.stdout, re.S)
+    if not m:
+        return []
+    try:
+        out = json.loads(m.group(0))
+    except ValueError:
+        _warn("extraction output was not valid JSON; will retry next harvest")
+        return None
+    return [c for c in out if isinstance(c, dict)] if isinstance(out, list) else []
+
+
+def cmd_harvest(args) -> int:
+    """Automatic extraction: agent transcript → candidate facts → reconcile.
+
+    Closes the discipline gap (Mem0-style zero-cooperation capture) without
+    Mem0's failure modes: one LLM call per session-delta (not per message),
+    a REJECT gate in the prompt, and EVERY candidate goes through the
+    reconcile pipeline — exact dups and recall-echoes die before storage.
+    Watermark (harvest_state) means bytes are never reprocessed.
+    """
+    if os.environ.get("BRAIN_HARVEST") == "1":
+        return 0  # spawned from inside an extraction call — never recurse
+
+    path = Path(args.transcript).expanduser()
+    if not path.exists():
+        return _err(f"transcript not found: {path}")
+
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    ensure_harvest_table(conn)
+    row = cursor.execute(
+        "SELECT byte_offset FROM harvest_state WHERE path = ?", (str(path),)
+    ).fetchone()
+    offset = row["byte_offset"] if row else 0
+
+    text, new_offset = _transcript_delta(path, offset)
+    if len(text) < args.min_delta and not args.force:
+        # Watermark intentionally NOT advanced: small deltas accumulate until
+        # they're worth one extraction call.
+        print(f"delta {len(text)} chars < {args.min_delta} — skipped (accumulating)")
+        return 0
+    if len(text) > HARVEST_MAX_DELTA:
+        text = text[-HARVEST_MAX_DELTA:]
+
+    # Project hint from Claude Code's transcript dir naming (-Users-x-Documents-foo).
+    project = args.project or path.parent.name.split("-")[-1] or "general"
+
+    if args.dry_run:
+        print(HARVEST_PROMPT.format(project=project, conversation=text))
+        print(f"\n[dry-run] {len(text)} chars would be sent to model '{args.model}'")
+        return 0
+
+    candidates = _extract_candidates(
+        HARVEST_PROMPT.format(project=project, conversation=text), args.model)
+    if candidates is None:
+        return _err("extraction call failed — watermark unchanged, will retry next run")
+
+    added, noops, queued = [], [], []
+    review_path = Path.home() / ".config/brain/harvest-review.jsonl"
+    for c in candidates[:5]:
+        title = str(c.get("title", "")).strip()
+        content = str(c.get("content", "")).strip()
+        if not title:
+            continue
+        ns = argparse.Namespace(
+            type=str(c.get("type", "note")), title=title, content=content,
+            project=str(c.get("project", project)),
+            tags=[str(c.get("tags", ""))] if c.get("tags") else [],
+            abstract=str(c.get("abstract", "")) or None,
+            no_semantic=args.no_semantic, no_embed=False,
+        )
+        packet = _reconcile_decide(conn, cursor, title, content, ns)
+        if packet["suggestion"] == "add":
+            rc = cmd_save(argparse.Namespace(
+                **{**vars(ns), "area": "", "source_file": f"harvest:{path.name}",
+                   "force": False, "status": None, "priority": None, "energy": None,
+                   "points": None, "due_at": None, "external_ref": None,
+                   "parent_uid": None}))
+            (added if rc == 0 else noops).append(title)
+        elif packet["suggestion"] == "noop":
+            noops.append(title)
+        else:  # update / review — a human or interactive agent should decide
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(review_path, "a") as f:
+                f.write(json.dumps({"candidate": vars(ns) | {"tags": ns.tags},
+                                    "packet": packet}, ensure_ascii=False,
+                                   default=str) + "\n")
+            queued.append(title)
+
+    cursor.execute(
+        "INSERT INTO harvest_state(path, byte_offset, last_run) VALUES (?, ?, datetime('now')) "
+        "ON CONFLICT(path) DO UPDATE SET byte_offset = ?, last_run = datetime('now')",
+        (str(path), new_offset, new_offset),
+    )
+    conn.commit()
+
+    print(f"harvest: {len(candidates)} candidate(s) → {len(added)} added, "
+          f"{len(noops)} noop, {len(queued)} queued for review"
+          + (f" ({review_path})" if queued else ""))
     return 0
 
 
@@ -1643,6 +1855,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--superseded-by", help="uid of the memory that replaces this fact")
     s.add_argument("--undo", action="store_true", help="restore a previously invalidated memory")
     s.set_defaults(func=cmd_invalidate)
+
+    # harvest
+    s = sub.add_parser("harvest",
+                       help="Extract memories from an agent transcript (JSONL) via one LLM call")
+    s.add_argument("transcript", help="path to a Claude Code session .jsonl")
+    s.add_argument("--model", default="haiku", help="model for the extraction call (default haiku)")
+    s.add_argument("--min-delta", type=int, default=2000,
+                   help="min chars of new conversation before extracting (default 2000)")
+    s.add_argument("--project", help="override the project slug inferred from the path")
+    s.add_argument("--force", action="store_true", help="extract even below --min-delta")
+    s.add_argument("--dry-run", action="store_true", help="show what would be sent, change nothing")
+    s.add_argument("--no-semantic", action="store_true")
+    s.set_defaults(func=cmd_harvest)
 
     # consolidate
     s = sub.add_parser("consolidate",

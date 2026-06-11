@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "brain-cli"
-version = "3.3.0"
+version = "3.4.0"
 description = "Single-file personal knowledge CLI: typed commands over a SQLite memory DB with hybrid FTS5 + sqlite-vec retrieval (RRF fusion)"
 readme = "README.md"
 license = { text = "MIT" }
