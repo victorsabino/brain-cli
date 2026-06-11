@@ -119,6 +119,60 @@ def content_hash(title: str, content: str) -> str:
     return hashlib.sha256(f"{title}\n{content or ''}".encode()).hexdigest()[:16]
 
 
+_flags_cache: dict[str, bool] | None = None
+
+
+def _schema_flags(conn: sqlite3.Connection) -> dict[str, bool]:
+    """Which v4 columns exist. Lets new code run against un-migrated DBs
+    (features quietly degrade instead of erroring on missing columns)."""
+    global _flags_cache
+    if _flags_cache is None:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
+        _flags_cache = {
+            "invalid_at": "invalid_at" in cols,
+            "abstract": "abstract" in cols,
+        }
+    return _flags_cache
+
+
+def _log_recall(conn: sqlite3.Connection, memory_ids: list[int]) -> None:
+    """Record that these memories were surfaced into an agent's context.
+
+    `brain reconcile` reads this as a re-extraction guard: a candidate fact
+    that closely matches a recently-recalled memory is almost always the
+    agent re-saving its own injected context, not new knowledge.
+    Best-effort — recall must never fail because logging did.
+    """
+    if not memory_ids:
+        return
+    try:
+        conn.executemany(
+            "INSERT INTO recall_log(memory_id) VALUES (?)",
+            [(m,) for m in memory_ids],
+        )
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        _warn(f"recall_log write skipped ({e})")
+
+
+def _recently_recalled(conn: sqlite3.Connection, hours: int = 24) -> set[int]:
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT memory_id FROM recall_log WHERE recalled_at > datetime('now', ?)",
+            (f"-{hours} hours",),
+        )}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _auto_abstract(content: str, max_chars: int = 240) -> str:
+    """L0 fallback when no explicit --abstract was saved: head of the content,
+    whitespace-collapsed. Good enough for context lines; explicit abstracts
+    written by the saving agent are better."""
+    text = " ".join((content or "").split())
+    return text[:max_chars] + ("…" if len(text) > max_chars else "")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Alterations (revision audit trail)
 # ────────────────────────────────────────────────────────────────────────────
@@ -406,6 +460,14 @@ def cmd_save(args) -> int:
         """, (memory_id, args.status or "pending", args.priority, args.energy, args.points,
               args.due_at, args.external_ref, args.parent_uid))
 
+    # L0 abstract (one searchable sentence for `brain context` injection).
+    if getattr(args, "abstract", None):
+        if _schema_flags(conn)["abstract"]:
+            cursor.execute("UPDATE memories SET abstract = ? WHERE id = ?",
+                           (args.abstract.strip(), memory_id))
+        else:
+            _warn("--abstract ignored — run `brain migrate` (schema v4)")
+
     # Audit trail: record creation.
     log_alteration(conn, uid, "create", delta=title, reason=None)
 
@@ -420,7 +482,12 @@ def cmd_save(args) -> int:
 
 
 def _build_filters(conn: sqlite3.Connection, args) -> tuple[str, list]:
-    """Shared --type/--project/--since-days filter SQL (alias `m`)."""
+    """Shared --type/--project/--since-days + validity filter SQL (alias `m`).
+
+    Validity: invalidated facts (invalid_at set) are excluded by default —
+    stale knowledge must not outrank live knowledge. `--include-invalid`
+    shows everything; `--as-of <date>` time-travels (what was true then).
+    """
     sql, params = "", []
     if getattr(args, "type", None):
         sql += f" AND m.canonical_type IN ({','.join('?' * len(args.type))})"
@@ -431,7 +498,147 @@ def _build_filters(conn: sqlite3.Connection, args) -> tuple[str, list]:
     if getattr(args, "since_days", None):
         sql += " AND m.created_at > datetime('now', ?)"
         params.append(f"-{args.since_days} days")
+    if _schema_flags(conn)["invalid_at"]:
+        as_of = getattr(args, "as_of", None)
+        if as_of:
+            sql += " AND m.created_at <= ? AND (m.invalid_at IS NULL OR m.invalid_at > ?)"
+            params.extend([as_of, as_of])
+        elif not getattr(args, "include_invalid", False):
+            sql += " AND m.invalid_at IS NULL"
     return sql, params
+
+
+def _abstract_col(conn: sqlite3.Connection) -> str:
+    return "m.abstract" if _schema_flags(conn)["abstract"] else "NULL AS abstract"
+
+
+def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
+                   filter_params: list, *, no_semantic: bool = False,
+                   want_explain: bool = False):
+    """Retrieval core shared by search / context / reconcile.
+
+    Ranked FTS5 + chunked semantic KNN fused with normalized RRF, plus small
+    additive recency/access bonuses. Returns (top, explain) where top is
+    [(score, row)] and explain maps memory id → score decomposition (always
+    populated when want_explain — reconcile needs the best-chunk sims).
+    """
+    pool = max(50, limit * 5)
+
+    # 1. FTS5 keyword — best-first (bm25 ASC), title/tags weighted above body.
+    #    Filters applied BEFORE the limit so filtered searches don't starve.
+    fts_ids: list[int] = []
+    words = [w.replace('"', "") for w in query.split()]
+    fts_terms = " OR ".join(f'"{w}"' for w in words if len(w) > 1)
+    if fts_terms:
+        t_fts = time.perf_counter()
+        try:
+            fts_ids = [r["id"] for r in cursor.execute(f"""
+                SELECT m.id AS id
+                FROM memories_fts
+                JOIN memories m ON m.rowid = memories_fts.rowid
+                WHERE memories_fts MATCH ? AND m.deleted_at IS NULL{filter_sql}
+                ORDER BY bm25(memories_fts, 4.0, 1.0, 3.0, 2.0, 1.0)
+                LIMIT ?
+            """, (fts_terms, *filter_params, pool))]
+        except sqlite3.OperationalError as e:
+            _warn(f"FTS query failed ({e}); keyword side skipped")
+        _timing("fts query", t_fts)
+
+    # 2. Semantic — chunked KNN (cosine), best chunk per memory. Oversampled
+    #    because several chunks can belong to one memory and filters apply after.
+    sem_pairs: list[tuple[int, float]] = []
+    if _vec_loaded and not no_semantic:
+        # Query-embedding cache first: a hit means the model is never even
+        # lazy-loaded — repeat queries go straight to KNN.
+        qhash = hashlib.sha256(query.encode()).hexdigest()
+        t_cache = time.perf_counter()
+        qvec = _query_cache_get(conn, qhash)
+        _timing("query cache " + ("hit" if qvec is not None else "miss"), t_cache)
+        if qvec is None:
+            t_model = time.perf_counter()
+            get_embedder()  # idempotent — surface the lazy model-load cost alone
+            _timing("model load", t_model)
+            qvec = embed(query)
+            if qvec is not None:
+                _query_cache_put(conn, qhash, qvec)
+        t_knn = time.perf_counter()
+        if qvec is not None:
+            k = pool * (4 if filter_sql else 2)
+            best: dict[int, float] = {}
+            try:
+                for r in cursor.execute("""
+                    SELECT memory_id AS id, distance
+                    FROM memory_chunks
+                    WHERE embedding MATCH ? AND k = ?
+                """, (qvec, k)):
+                    sim = 1.0 - r["distance"]  # cosine distance → similarity
+                    if sim > best.get(r["id"], -1.0):
+                        best[r["id"]] = sim
+            except sqlite3.OperationalError as e:
+                _warn(f"memory_chunks KNN failed ({e}); trying legacy memory_vectors")
+                # Legacy single-vector table: L2 over normalized vecs → cos = 1 - d²/2.
+                try:
+                    for r in cursor.execute("""
+                        SELECT memory_id AS id, distance
+                        FROM memory_vectors
+                        WHERE embedding MATCH ? AND k = ?
+                    """, (qvec, k)):
+                        best[r["id"]] = 1.0 - (r["distance"] ** 2) / 2.0
+                except sqlite3.OperationalError as e2:
+                    _warn(f"memory_vectors KNN failed ({e2}); semantic side skipped")
+            sem_pairs = sorted(best.items(), key=lambda x: x[1], reverse=True)
+        _timing("knn query", t_knn)
+
+    candidate_ids = set(fts_ids) | {mid for mid, _ in sem_pairs}
+    if not candidate_ids:
+        return [], ({} if want_explain else None)
+
+    placeholders = ",".join("?" * len(candidate_ids))
+    rows = cursor.execute(f"""
+        SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
+               m.created_at, m.access_count, {_abstract_col(conn)}
+        FROM memories m
+        WHERE m.id IN ({placeholders}) AND m.deleted_at IS NULL{filter_sql}
+    """, (*candidate_ids, *filter_params)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    # Ranks among surviving (filter-passing) candidates only.
+    fts_rank = {mid: i for i, mid in enumerate(m for m in fts_ids if m in by_id)}
+    sem_rank = {mid: i for i, mid in enumerate(mid for mid, _ in sem_pairs if mid in by_id)}
+
+    # 3. RRF fusion, normalized so rank-1 in both lists ≈ 1.0, then small
+    #    additive recency/access bonuses (tiebreakers, capped).
+    t_fusion = time.perf_counter()
+    sims = dict(sem_pairs)  # best-chunk cosine sim per memory
+    explain: dict[int, dict] | None = {} if want_explain else None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    full = 2.0 / (RRF_K + 1)
+    scored = []
+    for mid, r in by_id.items():
+        rrf_fts = 1.0 / (RRF_K + fts_rank[mid] + 1) / full if mid in fts_rank else 0.0
+        rrf_sem = 1.0 / (RRF_K + sem_rank[mid] + 1) / full if mid in sem_rank else 0.0
+        try:
+            age_days = (now - datetime.fromisoformat(str(r["created_at"] or "").split(".")[0])).days
+        except (TypeError, ValueError):
+            age_days = 9999
+        recency = 0.05 * math.exp(-max(age_days, 0) / 365.0)
+        access = min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
+        score = rrf_fts + rrf_sem + recency + access
+        if explain is not None:
+            explain[mid] = {
+                "fts_rank": fts_rank.get(mid),
+                "sem_rank": sem_rank.get(mid),
+                "sim": round(sims[mid], 4) if mid in sims else None,
+                "rrf_fts": round(rrf_fts, 4), "rrf_sem": round(rrf_sem, 4),
+                "rrf": round(rrf_fts + rrf_sem, 4),
+                "recency_bonus": round(recency, 4), "access_bonus": round(access, 4),
+                "final": round(score, 4),
+            }
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    _timing("fusion", t_fusion)
+    return scored[:limit], explain
 
 
 def _explain_line(e: dict) -> str:
@@ -446,20 +653,29 @@ def _explain_line(e: dict) -> str:
 
 
 def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: bool,
-                   explain: dict[int, dict] | None = None) -> None:
+                   explain: dict[int, dict] | None = None, compact: bool = False) -> None:
     if as_json:
         out = []
         for score, r in top:
-            d = {
-                "uid": r["uid"], "type": r["type"], "title": r["title"],
-                "snippet": (r["content"] or "")[:300],
-                "project": r["project"], "score": round(score, 3),
-                "created_at": r["created_at"],
-            }
+            if compact:
+                d = {"uid": r["uid"], "type": r["type"], "title": r["title"],
+                     "created_at": r["created_at"], "score": round(score, 3)}
+            else:
+                d = {
+                    "uid": r["uid"], "type": r["type"], "title": r["title"],
+                    "snippet": (r["content"] or "")[:300],
+                    "project": r["project"], "score": round(score, 3),
+                    "created_at": r["created_at"],
+                }
             if explain is not None and r["id"] in explain:
                 d["explain"] = explain[r["id"]]
             out.append(d)
         print(json.dumps(out, ensure_ascii=False, indent=2))
+    elif compact:
+        # ~10x fewer tokens per hit: uid + title only. Agents filter here,
+        # then `brain get` the few that matter (claude-mem's 3-step lesson).
+        for score, r in top:
+            print(f"{r['uid']}  [{r['type']:8}] {r['title']}  ({str(r['created_at'] or '')[:10]})")
     else:
         print(f"\n{len(top)} hit(s) for: {query}\n")
         for score, r in top:
@@ -504,135 +720,74 @@ def cmd_search(args) -> int:
             ORDER BY m.updated_at DESC
             LIMIT ?
         """, (*filter_params, limit)).fetchall()
-        _print_results([(0.0, r) for r in rows], conn, "(listing)", args.json)
+        _print_results([(0.0, r) for r in rows], conn, "(listing)", args.json,
+                       compact=getattr(args, "compact", False))
         return 0
 
-    pool = max(50, limit * 5)
-
-    # 1. FTS5 keyword — best-first (bm25 ASC), title/tags weighted above body.
-    #    Filters applied BEFORE the limit so filtered searches don't starve.
-    fts_ids: list[int] = []
-    words = [w.replace('"', "") for w in query.split()]
-    fts_terms = " OR ".join(f'"{w}"' for w in words if len(w) > 1)
-    if fts_terms:
-        t_fts = time.perf_counter()
-        try:
-            fts_ids = [r["id"] for r in cursor.execute(f"""
-                SELECT m.id AS id
-                FROM memories_fts
-                JOIN memories m ON m.rowid = memories_fts.rowid
-                WHERE memories_fts MATCH ? AND m.deleted_at IS NULL{filter_sql}
-                ORDER BY bm25(memories_fts, 4.0, 1.0, 3.0, 2.0, 1.0)
-                LIMIT ?
-            """, (fts_terms, *filter_params, pool))]
-        except sqlite3.OperationalError as e:
-            _warn(f"FTS query failed ({e}); keyword side skipped")
-        _timing("fts query", t_fts)
-
-    # 2. Semantic — chunked KNN (cosine), best chunk per memory. Oversampled
-    #    because several chunks can belong to one memory and filters apply after.
-    sem_pairs: list[tuple[int, float]] = []
-    if _vec_loaded and not args.no_semantic:
-        # Query-embedding cache first: a hit means the model is never even
-        # lazy-loaded — repeat queries go straight to KNN.
-        qhash = hashlib.sha256(query.encode()).hexdigest()
-        t_cache = time.perf_counter()
-        qvec = _query_cache_get(conn, qhash)
-        _timing("query cache " + ("hit" if qvec is not None else "miss"), t_cache)
-        if qvec is None:
-            t_model = time.perf_counter()
-            get_embedder()  # idempotent — surface the lazy model-load cost alone
-            _timing("model load", t_model)
-            qvec = embed(query)
-            if qvec is not None:
-                _query_cache_put(conn, qhash, qvec)
-        t_knn = time.perf_counter()
-        if qvec is not None:
-            k = pool * (4 if filter_sql else 2)
-            best: dict[int, float] = {}
-            try:
-                for r in cursor.execute("""
-                    SELECT memory_id AS id, distance
-                    FROM memory_chunks
-                    WHERE embedding MATCH ? AND k = ?
-                """, (qvec, k)):
-                    sim = 1.0 - r["distance"]  # cosine distance → similarity
-                    if sim > best.get(r["id"], -1.0):
-                        best[r["id"]] = sim
-            except sqlite3.OperationalError as e:
-                _warn(f"memory_chunks KNN failed ({e}); trying legacy memory_vectors")
-                # Legacy single-vector table: L2 over normalized vecs → cos = 1 - d²/2.
-                try:
-                    for r in cursor.execute("""
-                        SELECT memory_id AS id, distance
-                        FROM memory_vectors
-                        WHERE embedding MATCH ? AND k = ?
-                    """, (qvec, k)):
-                        best[r["id"]] = 1.0 - (r["distance"] ** 2) / 2.0
-                except sqlite3.OperationalError as e2:
-                    _warn(f"memory_vectors KNN failed ({e2}); semantic side skipped")
-            sem_pairs = sorted(best.items(), key=lambda x: x[1], reverse=True)
-        _timing("knn query", t_knn)
-
-    candidate_ids = set(fts_ids) | {mid for mid, _ in sem_pairs}
-    if not candidate_ids:
-        if args.json:
-            print("[]")
-        else:
-            print(f"No results for: {query}")
-        return 0
-
-    placeholders = ",".join("?" * len(candidate_ids))
-    rows = cursor.execute(f"""
-        SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
-               m.created_at, m.access_count
-        FROM memories m
-        WHERE m.id IN ({placeholders}) AND m.deleted_at IS NULL{filter_sql}
-    """, (*candidate_ids, *filter_params)).fetchall()
-    by_id = {r["id"]: r for r in rows}
-
-    # Ranks among surviving (filter-passing) candidates only.
-    fts_rank = {mid: i for i, mid in enumerate(m for m in fts_ids if m in by_id)}
-    sem_rank = {mid: i for i, mid in enumerate(mid for mid, _ in sem_pairs if mid in by_id)}
-
-    # 3. RRF fusion, normalized so rank-1 in both lists ≈ 1.0, then small
-    #    additive recency/access bonuses (tiebreakers, capped).
-    t_fusion = time.perf_counter()
-    sims = dict(sem_pairs)  # best-chunk cosine sim per memory (for --explain)
-    explain: dict[int, dict] | None = {} if getattr(args, "explain", False) else None
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    full = 2.0 / (RRF_K + 1)
-    scored = []
-    for mid, r in by_id.items():
-        rrf_fts = 1.0 / (RRF_K + fts_rank[mid] + 1) / full if mid in fts_rank else 0.0
-        rrf_sem = 1.0 / (RRF_K + sem_rank[mid] + 1) / full if mid in sem_rank else 0.0
-        try:
-            age_days = (now - datetime.fromisoformat(str(r["created_at"] or "").split(".")[0])).days
-        except (TypeError, ValueError):
-            age_days = 9999
-        recency = 0.05 * math.exp(-max(age_days, 0) / 365.0)
-        access = min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
-        score = rrf_fts + rrf_sem + recency + access
-        if explain is not None:
-            explain[mid] = {
-                "fts_rank": fts_rank.get(mid),
-                "sem_rank": sem_rank.get(mid),
-                "sim": round(sims[mid], 4) if mid in sims else None,
-                "rrf_fts": round(rrf_fts, 4), "rrf_sem": round(rrf_sem, 4),
-                "rrf": round(rrf_fts + rrf_sem, 4),
-                "recency_bonus": round(recency, 4), "access_bonus": round(access, 4),
-                "final": round(score, 4),
-            }
-        scored.append((score, r))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:limit]
-    _timing("fusion", t_fusion)
+    top, explain = _hybrid_search(
+        conn, cursor, query, limit, filter_sql, filter_params,
+        no_semantic=args.no_semantic, want_explain=getattr(args, "explain", False),
+    )
     _timing("total", t_total)
+    if not top:
+        print("[]" if args.json else f"No results for: {query}")
+        return 0
 
     # access_count is bumped on `brain get` only — search must not reinforce
     # its own ranking (rich-get-richer loop on frequently-surfaced junk).
-    _print_results(top, conn, query, args.json, explain=explain)
+    _print_results(top, conn, query, args.json, explain=explain,
+                   compact=getattr(args, "compact", False))
+    return 0
+
+
+def cmd_context(args) -> int:
+    """Emit a prompt-ready block of relevant memories under a hard token budget.
+
+    L0 abstracts only (~1 line per memory) — agents inject this at session
+    start / prompt time, then `brain get <uid>` for anything that matters.
+    Budget is a HARD cap (≈4 chars/token); claude-mem's top complaint class
+    is unbounded memory injection burning the user's context window.
+    Included memories are recorded in recall_log (re-extraction guard).
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    query = (args.query or "").strip()
+    if not query:
+        return _err("query required (e.g. the project name or current task)")
+
+    filter_sql, filter_params = _build_filters(conn, args)
+    top, _ = _hybrid_search(conn, cursor, query, args.limit, filter_sql,
+                            filter_params, no_semantic=args.no_semantic)
+    if not top:
+        print(f"(no brain memories matched: {query})")
+        return 0
+
+    budget_chars = max(args.budget, 100) * 4
+    header = f"## Relevant memories (brain) — {query}"
+    footer = "(full detail: `brain get <uid>`)"
+    used = len(header) + len(footer) + 2
+    entries = []
+    for score, r in top:
+        abstract = r["abstract"] or _auto_abstract(r["content"])
+        line = f"- [{r['type']}] {r['title']} — {abstract} ({r['uid']}, {str(r['created_at'] or '')[:10]})"
+        if entries and used + len(line) + 1 > budget_chars:
+            break
+        entries.append((line, r, abstract, score))
+        used += len(line) + 1
+
+    if args.json:
+        print(json.dumps([{
+            "uid": r["uid"], "type": r["type"], "title": r["title"],
+            "abstract": abstract, "project": r["project"],
+            "created_at": r["created_at"], "score": round(score, 3),
+        } for _, r, abstract, score in entries], ensure_ascii=False, indent=2))
+    else:
+        print(header)
+        for line, *_ in entries:
+            print(line)
+        print(footer)
+
+    _log_recall(conn, [r["id"] for _, r, _, _ in entries])
     return 0
 
 
@@ -649,10 +804,14 @@ def cmd_get(args) -> int:
     if not r:
         return _err(f"uid {args.uid} not found")
 
-    # Update access tracking.
+    # Update access tracking + recall log (re-extraction guard input).
     conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?", (r["id"],))
     conn.commit()
+    _log_recall(conn, [r["id"]])
 
+    keys = r.keys()
+    invalid_at = r["invalid_at"] if "invalid_at" in keys else None
+    superseded = r["superseded_by"] if "superseded_by" in keys else None
     if args.json:
         d = dict(r)
         d.pop("content_hash", None)
@@ -660,6 +819,9 @@ def cmd_get(args) -> int:
     else:
         print(f"\n{r['title']}")
         print(f"[{r['canonical_type'] or r['type']}] {r['uid']} · {r['created_at']}")
+        if invalid_at:
+            note = f" — superseded by {superseded} (`brain get {superseded}`)" if superseded else ""
+            print(f"⚠ INVALIDATED {invalid_at}{note}")
         if r["project"]:
             print(f"project: {r['project']}")
         if r["all_tags"]:
@@ -722,8 +884,8 @@ def cmd_update(args) -> int:
 
     Keeps content_hash, updated_at, FTS (trigger-synced), and embeddings in sync.
     """
-    if not args.append and args.replace is None:
-        return _err("provide --append \"<text>\" or --replace \"<full content>\"")
+    if not args.append and args.replace is None and not getattr(args, "abstract", None):
+        return _err("provide --append \"<text>\", --replace \"<full content>\", or --abstract")
     if args.append and args.replace is not None:
         return _err("use only one of --append / --replace, not both")
 
@@ -743,6 +905,7 @@ def cmd_update(args) -> int:
     title = row["title"]
     old_content = row["content"] or ""
 
+    kind = None
     if args.append:
         text = args.append.strip()
         if not text:
@@ -752,30 +915,339 @@ def cmd_update(args) -> int:
         new_content = old_content + bullet
         kind = "append"
         delta = bullet.strip()
-    else:
+    elif args.replace is not None:
         new_content = args.replace
         kind = "replace"
         delta = new_content
+    else:
+        new_content = old_content  # --abstract only: content untouched
 
-    new_hash = content_hash(title, new_content)
+    if kind:
+        new_hash = content_hash(title, new_content)
+        # The AFTER UPDATE trigger on memories re-syncs memories_fts automatically,
+        # and a BEFORE UPDATE trigger snapshots the old content into memory_versions.
+        cursor.execute(
+            "UPDATE memories SET content = ?, content_hash = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (new_content, new_hash, memory_id),
+        )
+        log_alteration(conn, args.uid, kind, delta=delta, reason=args.reason)
 
-    # The AFTER UPDATE trigger on memories re-syncs memories_fts automatically,
-    # and a BEFORE UPDATE trigger snapshots the old content into memory_versions.
-    cursor.execute(
-        "UPDATE memories SET content = ?, content_hash = ?, updated_at = datetime('now') "
-        "WHERE id = ?",
-        (new_content, new_hash, memory_id),
-    )
-
-    log_alteration(conn, args.uid, kind, delta=delta, reason=args.reason)
+    if getattr(args, "abstract", None):
+        if _schema_flags(conn)["abstract"]:
+            cursor.execute("UPDATE memories SET abstract = ? WHERE id = ?",
+                           (args.abstract.strip(), memory_id))
+            if not kind:
+                log_alteration(conn, args.uid, "abstract", delta=args.abstract.strip()[:80],
+                               reason=args.reason)
+        else:
+            _warn("--abstract ignored — run `brain migrate` (schema v4)")
 
     # Re-embed in the SAME transaction, then one commit (see _embed_in_txn).
-    if _vec_loaded:
+    if kind and _vec_loaded:
         _embed_in_txn(conn, cursor, memory_id, title, new_content, args.uid)
 
     conn.commit()
 
     print(args.uid)
+    return 0
+
+
+def cmd_invalidate(args) -> int:
+    """Soft fact invalidation (Zep's bi-temporal lesson): wrong/superseded
+    knowledge is marked invalid_at, never deleted. Default search excludes it;
+    `--include-invalid` / `--as-of <date>` still see it. History stays intact.
+    """
+    conn = connect()
+    if not _schema_flags(conn)["invalid_at"]:
+        return _err("invalid_at column missing — run `brain migrate` (schema v4)")
+
+    row = conn.execute(
+        "SELECT id, invalid_at FROM memories WHERE uid = ? AND deleted_at IS NULL",
+        (args.uid,),
+    ).fetchone()
+    if not row:
+        return _err(f"uid {args.uid} not found")
+
+    if args.undo:
+        if row["invalid_at"] is None:
+            return _err(f"{args.uid} is not invalidated")
+        conn.execute("UPDATE memories SET invalid_at = NULL, superseded_by = NULL WHERE id = ?",
+                     (row["id"],))
+        log_alteration(conn, args.uid, "revalidate", reason=args.reason)
+        conn.commit()
+        print(f"revalidated {args.uid}")
+        return 0
+
+    if row["invalid_at"] is not None:
+        return _err(f"{args.uid} already invalidated at {row['invalid_at']} (--undo to restore)")
+
+    keeper = None
+    if args.superseded_by:
+        keeper = conn.execute(
+            "SELECT id, uid FROM memories WHERE uid = ? AND deleted_at IS NULL",
+            (args.superseded_by,),
+        ).fetchone()
+        if not keeper:
+            return _err(f"--superseded-by uid {args.superseded_by} not found")
+
+    conn.execute(
+        "UPDATE memories SET invalid_at = datetime('now'), superseded_by = ? WHERE id = ?",
+        (keeper["uid"] if keeper else None, row["id"]),
+    )
+    log_alteration(conn, args.uid, "invalidate",
+                   delta=f"superseded_by {keeper['uid']}" if keeper else None,
+                   reason=args.reason)
+    if keeper:
+        try:
+            conn.execute("INSERT INTO memory_links(src_id, dst_id, kind) VALUES (?, ?, 'superseded_by')",
+                         (row["id"], keeper["id"]))
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    print(f"invalidated {args.uid}" + (f" → superseded by {keeper['uid']}" if keeper else ""))
+    return 0
+
+
+# Reconcile similarity thresholds (Mem0's AUDN loop, decided by the CALLING
+# agent instead of an API call — brain itself stays LLM-free).
+SIM_NOOP_RECALLED = 0.92   # ≥ this AND recently recalled → re-extraction echo
+SIM_UPDATE = 0.85          # ≥ this → same topic, merge into the neighbor
+SIM_REVIEW = 0.70          # ≥ this → ambiguous, agent must look
+
+
+def cmd_reconcile(args) -> int:
+    """ADD/UPDATE/NOOP decision packet for a candidate fact (search-then-merge,
+    enforced). The agent calls this INSTEAD of blind `brain save`:
+
+      suggestion=add     → safe to save (use --auto to do it in one step)
+      suggestion=noop    → exact duplicate, or a re-extraction echo of a
+                           memory recalled in the last 24h (Mem0's 808-dup
+                           feedback loop — the guard exists because of it)
+      suggestion=update  → same topic exists: `brain update <uid> --append`
+      suggestion=review  → ambiguous; agent reads neighbors and decides
+                           (update / save / invalidate the old one)
+
+    --auto: applies 'add' (saves, prints uid), exits 2 on 'noop' (like dedup),
+    exits 3 on 'update'/'review' (packet printed — agent must decide).
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    title = args.title.strip()
+    content = (args.content or "").strip()
+    if not title:
+        return _err("--title is required")
+
+    h = content_hash(title, content)
+    flags = _schema_flags(conn)
+    invalid_sql = " AND invalid_at IS NULL" if flags["invalid_at"] else ""
+    exact = cursor.execute(
+        f"SELECT uid FROM memories WHERE content_hash = ? AND deleted_at IS NULL{invalid_sql} LIMIT 1",
+        (h,),
+    ).fetchone()
+
+    filter_sql, filter_params = _build_filters(conn, args)
+    top, explain = _hybrid_search(
+        conn, cursor, f"{title} {content[:300]}".strip(), 5, filter_sql,
+        filter_params, no_semantic=args.no_semantic, want_explain=True,
+    )
+    recalled = _recently_recalled(conn)
+    neighbors = []
+    for score, r in top:
+        sim = (explain or {}).get(r["id"], {}).get("sim")
+        neighbors.append({
+            "uid": r["uid"], "type": r["type"], "title": r["title"],
+            "project": r["project"], "sim": sim, "score": round(score, 3),
+            "abstract": r["abstract"] or _auto_abstract(r["content"], 160),
+            "recalled_recently": r["id"] in recalled,
+        })
+
+    best = neighbors[0] if neighbors else None
+    best_sim = (best or {}).get("sim") or 0.0
+    if exact:
+        suggestion, reason, target = "noop", f"exact content_hash duplicate of {exact['uid']}", exact["uid"]
+    elif best and best_sim >= SIM_NOOP_RECALLED and best["recalled_recently"]:
+        suggestion, reason, target = "noop", (
+            f"{best['uid']} (sim {best_sim:.2f}) was recalled into context in the last 24h — "
+            "this is almost certainly a re-extraction echo, not new knowledge"), best["uid"]
+    elif best and best_sim >= SIM_UPDATE:
+        suggestion, reason, target = "update", (
+            f"{best['uid']} covers the same topic (sim {best_sim:.2f}) — "
+            f"`brain update {best['uid']} --append \"...\"`"), best["uid"]
+    elif best and (best_sim >= SIM_REVIEW or best["sim"] is None):
+        suggestion, reason, target = "review", (
+            "close neighbors exist" + ("" if best["sim"] is not None else
+            " (semantic unavailable — FTS neighbors only)") +
+            " — read them and pick update / save / invalidate"), None
+    else:
+        suggestion, reason, target = "add", "no sufficiently similar memory found", None
+
+    packet = {
+        "suggestion": suggestion, "reason": reason, "target_uid": target,
+        "candidate": {"title": title, "content_hash": h, "type": args.type},
+        "neighbors": neighbors,
+    }
+
+    if args.auto:
+        if suggestion == "add":
+            return cmd_save(argparse.Namespace(
+                type=args.type, title=title, content=content,
+                project=args.project, area="", tags=args.tags,
+                source_file="", force=False, no_embed=args.no_embed,
+                abstract=getattr(args, "abstract", None),
+                status=None, priority=None, energy=None, points=None,
+                due_at=None, external_ref=None, parent_uid=None,
+            ))
+        print(json.dumps(packet, ensure_ascii=False, indent=2), file=sys.stderr)
+        if suggestion == "noop":
+            print(target)
+            return 2
+        return 3  # update/review — the agent must decide
+
+    print(json.dumps(packet, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_consolidate(args) -> int:
+    """Find near-duplicate clusters; merge with --merge (Letta's sleep-time
+    pass, run on demand). Report mode never writes. Merging marks dups
+    invalid_at + superseded_by=keeper — content is never destroyed, and the
+    agent should `brain update` the keeper first if the dups held unique facts.
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+
+    # ── merge mode ───────────────────────────────────────────────────────
+    if args.merge:
+        if len(args.merge) < 2:
+            return _err("--merge needs KEEPER DUP [DUP...]")
+        if not _schema_flags(conn)["invalid_at"]:
+            return _err("invalid_at column missing — run `brain migrate` (schema v4)")
+        keeper_uid, dup_uids = args.merge[0], args.merge[1:]
+        keeper = cursor.execute(
+            "SELECT id, uid FROM memories WHERE uid = ? AND deleted_at IS NULL",
+            (keeper_uid,)).fetchone()
+        if not keeper:
+            return _err(f"keeper uid {keeper_uid} not found")
+        merged = 0
+        for dup in dup_uids:
+            if dup == keeper_uid:
+                return _err("keeper cannot be its own duplicate")
+            row = cursor.execute(
+                "SELECT id, invalid_at FROM memories WHERE uid = ? AND deleted_at IS NULL",
+                (dup,)).fetchone()
+            if not row:
+                return _err(f"dup uid {dup} not found")
+            if row["invalid_at"] is not None:
+                print(f"- {dup} already invalidated, skipped")
+                continue
+            cursor.execute(
+                "UPDATE memories SET invalid_at = datetime('now'), superseded_by = ? WHERE id = ?",
+                (keeper["uid"], row["id"]))
+            log_alteration(conn, dup, "invalidate",
+                           delta=f"superseded_by {keeper['uid']}",
+                           reason="consolidate merge")
+            try:
+                cursor.execute(
+                    "INSERT INTO memory_links(src_id, dst_id, kind) VALUES (?, ?, 'superseded_by')",
+                    (row["id"], keeper["id"]))
+            except sqlite3.IntegrityError:
+                pass
+            merged += 1
+        conn.commit()
+        print(f"merged {merged} duplicate(s) into {keeper_uid}")
+        return 0
+
+    # ── report mode (read-only) ──────────────────────────────────────────
+    filter_sql, filter_params = _build_filters(conn, args)
+    rows = cursor.execute(f"""
+        SELECT m.id, m.uid, m.title, m.project, m.created_at, m.content_hash
+        FROM memories m WHERE m.deleted_at IS NULL{filter_sql}
+    """, filter_params).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    pair_sim: dict[tuple[int, int], float] = {}
+
+    # Exact-hash duplicates (sim 1.0) — cheap SQL, catches --force accidents.
+    for hash_val, ids_csv in cursor.execute(f"""
+        SELECT m.content_hash, GROUP_CONCAT(m.id) FROM memories m
+        WHERE m.deleted_at IS NULL{filter_sql}
+        GROUP BY m.content_hash HAVING COUNT(*) > 1
+    """, filter_params):
+        ids = [int(i) for i in ids_csv.split(",")]
+        for a, b in zip(ids, ids[1:]):
+            union(a, b)
+            pair_sim[(min(a, b), max(a, b))] = 1.0
+
+    # Embedding near-duplicates: each memory's first chunk KNN'd against all
+    # chunks; cross-memory hits above threshold cluster together.
+    if _vec_loaded:
+        t0 = time.perf_counter()
+        for mid in by_id:
+            vec = cursor.execute(
+                "SELECT embedding FROM memory_chunks WHERE rowid = ?",
+                (mid * CHUNK_CAP,)).fetchone()
+            if not vec:
+                continue
+            try:
+                for r in cursor.execute("""
+                    SELECT memory_id AS id, distance FROM memory_chunks
+                    WHERE embedding MATCH ? AND k = 8
+                """, (vec["embedding"],)):
+                    other, sim = r["id"], 1.0 - r["distance"]
+                    if other != mid and other in by_id and sim >= args.threshold:
+                        union(mid, other)
+                        key = (min(mid, other), max(mid, other))
+                        pair_sim[key] = max(pair_sim.get(key, 0.0), sim)
+            except sqlite3.OperationalError as e:
+                _warn(f"consolidate KNN failed ({e}); hash-only clusters")
+                break
+        _timing("consolidate KNN sweep", t0)
+
+    clusters: dict[int, list[int]] = {}
+    for mid in set(parent) | {m for pair in pair_sim for m in pair}:
+        clusters.setdefault(find(mid), []).append(mid)
+    clusters = {k: sorted(v) for k, v in clusters.items() if len(v) > 1}
+
+    def cluster_sim(members: list[int]) -> float:
+        sims = [s for (a, b), s in pair_sim.items() if a in members and b in members]
+        return max(sims) if sims else 0.0
+
+    ranked = sorted(clusters.values(), key=cluster_sim, reverse=True)[:args.limit]
+    if not ranked:
+        print("no near-duplicate clusters found")
+        return 0
+
+    if args.json:
+        print(json.dumps([{
+            "max_sim": round(cluster_sim(members), 4),
+            "members": [{"uid": by_id[m]["uid"], "title": by_id[m]["title"],
+                         "project": by_id[m]["project"],
+                         "created_at": by_id[m]["created_at"]} for m in members],
+        } for members in ranked], ensure_ascii=False, indent=2))
+    else:
+        print(f"\n{len(ranked)} cluster(s) (threshold {args.threshold}):\n")
+        for members in ranked:
+            print(f"≈ {cluster_sim(members):.2f}")
+            for m in members:
+                r = by_id[m]
+                proj = f" ({r['project']})" if r["project"] else ""
+                print(f"    {r['uid']}  {r['title']}{proj}  {str(r['created_at'] or '')[:10]}")
+            print("    → review, move unique facts into the keeper, then:")
+            print(f"      brain consolidate --merge {' '.join(by_id[m]['uid'] for m in members)}\n")
     return 0
 
 
@@ -836,8 +1308,15 @@ def cmd_stats(args) -> int:
             _warn(f"memory_vectors count failed: {e2}")
     schema_v = conn.execute("SELECT value FROM stats WHERE key = 'brain_schema_version'").fetchone()
 
+    invalidated = 0
+    if _schema_flags(conn)["invalid_at"]:
+        invalidated = conn.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE deleted_at IS NULL AND invalid_at IS NOT NULL"
+        ).fetchone()["n"]
+
     print(f"\nbrain v{schema_v['value'] if schema_v else '?'}")
-    print(f"  active:    {total}")
+    print(f"  active:    {total - invalidated}")
+    print(f"  invalid:   {invalidated}")
     print(f"  deleted:   {deleted}")
     print(f"  embedded:  {embed_count}/{total}")
     print("\nby type:")
@@ -851,9 +1330,10 @@ def cmd_stats(args) -> int:
 
 def cmd_recent(args) -> int:
     conn = connect()
-    rows = conn.execute("""
+    extra = " AND invalid_at IS NULL" if _schema_flags(conn)["invalid_at"] else ""
+    rows = conn.execute(f"""
         SELECT uid, COALESCE(canonical_type, type) AS type, title, project, created_at
-        FROM memories WHERE deleted_at IS NULL
+        FROM memories WHERE deleted_at IS NULL{extra}
         ORDER BY created_at DESC LIMIT ?
     """, (args.n,)).fetchall()
     for r in rows:
@@ -1100,6 +1580,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--area", default="")
     s.add_argument("--tags", action="append", default=[], help="comma-separated; can repeat flag")
     s.add_argument("--source-file", default="")
+    s.add_argument("--abstract", help="~1-sentence L0 summary used by `brain context`")
     s.add_argument("--force", action="store_true", help="bypass dedup")
     s.add_argument("--no-embed", action="store_true", help="skip embedding")
     # task-only:
@@ -1121,8 +1602,58 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--since-days", type=int, help="only memories from last N days")
     s.add_argument("--no-semantic", action="store_true")
     s.add_argument("--explain", action="store_true", help="show per-result score decomposition")
+    s.add_argument("--compact", action="store_true", help="uid+title only (~10x fewer tokens/hit)")
+    s.add_argument("--include-invalid", action="store_true", help="also show invalidated memories")
+    s.add_argument("--as-of", help="time travel: what was true at this date (YYYY-MM-DD)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
+
+    # context
+    s = sub.add_parser("context", help="Prompt-ready memory block under a hard token budget")
+    s.add_argument("query", help="topic seed (project name, current task, ...)")
+    s.add_argument("--budget", type=int, default=2000, help="max tokens to emit (default 2000)")
+    s.add_argument("--limit", type=int, default=20, help="retrieval pool before budgeting")
+    s.add_argument("--type", action="append")
+    s.add_argument("--project")
+    s.add_argument("--since-days", type=int)
+    s.add_argument("--no-semantic", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_context)
+
+    # reconcile
+    s = sub.add_parser("reconcile",
+                       help="ADD/UPDATE/NOOP decision packet for a candidate fact (use before save)")
+    s.add_argument("--type", default="note")
+    s.add_argument("--title", required=True)
+    s.add_argument("--content", default="")
+    s.add_argument("--project", default="")
+    s.add_argument("--tags", action="append", default=[])
+    s.add_argument("--abstract")
+    s.add_argument("--auto", action="store_true",
+                   help="apply 'add' directly; exit 2 on noop, 3 when the agent must decide")
+    s.add_argument("--no-embed", action="store_true")
+    s.add_argument("--no-semantic", action="store_true")
+    s.set_defaults(func=cmd_reconcile)
+
+    # invalidate
+    s = sub.add_parser("invalidate",
+                       help="Mark a memory's fact as no longer true (soft, reversible)")
+    s.add_argument("uid")
+    s.add_argument("--reason", help="why (recorded in alterations)")
+    s.add_argument("--superseded-by", help="uid of the memory that replaces this fact")
+    s.add_argument("--undo", action="store_true", help="restore a previously invalidated memory")
+    s.set_defaults(func=cmd_invalidate)
+
+    # consolidate
+    s = sub.add_parser("consolidate",
+                       help="Find near-duplicate clusters (read-only); --merge to supersede dups")
+    s.add_argument("--threshold", type=float, default=0.85, help="cosine sim cutoff (default 0.85)")
+    s.add_argument("--limit", type=int, default=20, help="max clusters to report")
+    s.add_argument("--project")
+    s.add_argument("--merge", nargs="+", metavar=("KEEPER", "DUP"),
+                   help="invalidate DUPs as superseded by KEEPER")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_consolidate)
 
     # get
     s = sub.add_parser("get", help="Show full memory by uid")
@@ -1150,6 +1681,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("uid")
     s.add_argument("--append", help="append a dated bullet to content")
     s.add_argument("--replace", help="replace the full content")
+    s.add_argument("--abstract", help="replace the L0 abstract used by `brain context`")
     s.add_argument("--reason", help="why this change (recorded in alterations)")
     s.set_defaults(func=cmd_update)
 
