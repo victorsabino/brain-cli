@@ -132,15 +132,21 @@ once it's installed:
 ## brain — persistent memory (https://github.com/victorsabino/brain-cli)
 
 - Before starting any non-trivial task, recall context:
-  `brain search "<topic keywords>" --limit 5`
+  `brain context "<topic / current task>" --budget 1500`
+  (or `brain search "<keywords>" --compact` to scan, then `brain get <uid>`)
 - After substantive work (root cause found, decision made, bug fixed,
-  pattern discovered), persist it — SEARCH-THEN-MERGE, never blind-save:
-  1. `brain search "<the fact in keywords>" --limit 3 --json`
-  2. Top hit is the same topic → `brain update <uid> --append "<new fact>" --reason "capture <date>"`
-  3. No same-topic hit → `brain save --type=<learning|decision|bug|snippet|note> --title="<concise, searchable>" --content="<the WHY, not just the what>" --project=<slug> --tags=<3-5,comma,separated>`
+  pattern discovered), persist it via RECONCILE — never blind-save:
+  1. `brain reconcile --auto --type=<learning|decision|bug|snippet|note> --title="<concise, searchable>" --content="<the WHY, not just the what>" --project=<slug> --tags=<3-5,comma,separated> --abstract="<one sentence>"`
+  2. Exit 0 → saved (uid printed). Exit 2 → already known (noop), move on.
+  3. Exit 3 → a similar memory exists: read the printed packet, then either
+     `brain update <uid> --append "<new fact>"` (same topic, new detail) or
+     `brain save` (genuinely distinct) — and if the old fact is now WRONG,
+     `brain invalidate <old_uid> --superseded-by <new_uid>`.
+- A fact stopped being true (config changed, service retired, decision
+  reversed)? `brain invalidate <uid> --reason "..."` — never delete.
 - Only persist what's useful in 1+ months. Skip trivia, file reads, chit-chat.
-- `save` exiting 2 with `DUPLICATE: <uid>` is fine — already known, move on.
 - Never write raw SQL against the DB; the `brain` CLI is the only interface.
+- Monthly hygiene: run `brain consolidate`, review clusters, `--merge` them.
 ```
 
 ---

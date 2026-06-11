@@ -5,6 +5,35 @@ All notable changes to brain-cli are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-06-11
+
+Memory-lifecycle release (schema v4): the mechanisms that keep a long-running
+memory store true — informed by the documented failure modes of Mem0
+(97.8%-junk audit, recall→re-extraction duplicate loops), Zep (fact
+invalidation), Letta (offline consolidation), and claude-mem (token burn).
+
+### Added
+- `brain reconcile [--auto]` — ADD/UPDATE/NOOP decision packet for a candidate
+  fact: top-5 neighbors with similarities; exact dups and re-extraction echoes
+  (≈ memory recalled into context <24h ago) come back `noop`. The calling
+  agent decides — brain itself makes no LLM calls.
+- `brain invalidate <uid> [--superseded-by <uid>] [--undo]` — soft fact
+  invalidation (`invalid_at`); default search/recent/context exclude
+  invalidated memories, `--include-invalid` shows them, `search --as-of
+  <date>` time-travels. `get` flags invalidated memories and points at the
+  successor.
+- `brain consolidate [--threshold] [--merge KEEPER DUP...]` — near-duplicate
+  sweep (exact content hashes + embedding clusters); report mode is
+  read-only, merge invalidates dups as superseded by the keeper.
+- `brain context "<query>" --budget N` — prompt-ready block of L0 abstracts
+  under a hard token cap; included memories are logged to `recall_log`
+  (the re-extraction guard's input).
+- `search --compact` — uid+title lines (~10x fewer tokens per hit).
+- `--abstract` on save/update — hand-written one-line L0 summary used by
+  `context` (falls back to the content head).
+- Schema v4: `invalid_at`, `abstract` columns + `recall_log` table; v4
+  features degrade gracefully on pre-v4 DBs until `brain migrate`.
+
 ## [Unreleased]
 
 ### Added

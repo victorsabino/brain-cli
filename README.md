@@ -29,13 +29,16 @@ rules file. Every step that touches the user's machine asks for consent first.
 
 ```bash
 brain save  --type=learning --title="..." --content="..." --tags=a,b,c
-brain search "natural language query" --limit=10
+brain search "natural language query" --limit=10   # --compact for ~10x fewer tokens
 brain get   <uid>
+brain context "current task" --budget 2000   # prompt-ready block, hard token cap
+brain reconcile --title "..." --content "..."  # ADD/UPDATE/NOOP packet before saving
+brain invalidate <uid> --superseded-by <uid>   # fact no longer true (soft, reversible)
+brain consolidate                              # near-duplicate clusters; --merge to fold
 brain link  <src_uid> <dst_uid> <kind>
-brain stats
-brain recent 20
+brain stats · brain recent 20
 brain reindex     # backfill embeddings
-brain migrate     # apply v3 schema
+brain migrate     # apply schema (v4)
 ```
 
 ## What it fixes
@@ -162,11 +165,40 @@ mixed-vector-space search. Note: on Apple Silicon the ONNX session init
 (CoreML graph partitioning) can make *load* slower than torch — measure with
 the parity script before adopting; the query cache is usually the bigger win.
 
+## Memory lifecycle (v4)
+
+Long-running memory stores rot in three documented ways — duplicates
+(Mem0's public audit: 97.8% junk after 32 days, one fact duplicated 808×
+by a recall→re-extraction loop), stale facts (~49% effective accuracy after
+30 days in independent tests), and unbounded context injection (claude-mem's
+top complaint class). v4 adds one mechanism against each:
+
+- **`brain reconcile`** — Mem0's ADD/UPDATE/DELETE/NOOP loop, minus the API
+  call: brain retrieves the top-5 neighbors with similarities and emits a
+  decision packet; the *calling agent* is the LLM that decides. Exact dups
+  and re-extraction echoes (candidate ≈ memory recalled into context <24h
+  ago, tracked in `recall_log`) come back `noop`. `--auto` applies safe adds
+  in one step (exit 2 = noop, 3 = agent must decide).
+- **`brain invalidate <uid>`** — Zep-style soft invalidation: wrong/superseded
+  facts get `invalid_at` set, never deleted. Default search excludes them;
+  `--include-invalid` shows everything; `--as-of 2026-01-15` time-travels.
+  `--superseded-by <uid>` records what replaced the fact (shown by `get`).
+- **`brain consolidate`** — offline near-duplicate sweep (exact hashes +
+  embedding clusters above `--threshold 0.85`). Read-only report;
+  `--merge KEEPER DUP...` folds clusters by invalidating dups as
+  superseded — content is never destroyed.
+- **`brain context "<query>" --budget 2000`** — prompt-ready block of L0
+  abstracts under a HARD token cap, for session-start / per-prompt
+  injection. Pass `--abstract` at save time for a hand-written one-liner;
+  otherwise the content head is used. Included memories land in
+  `recall_log`, which is what powers the re-extraction guard.
+
 ## Backwards compat
 
 Old commands `brain query` and `brain add` still work as aliases for `search`
 and `save`. Pre-migration DBs (no `memory_chunks`) fall back to the legacy
-single-vector `memory_vectors` table.
+single-vector `memory_vectors` table; v4 features degrade gracefully on
+pre-v4 schemas (filters skip, `--abstract` warns) until `brain migrate` runs.
 
 ## Development
 
