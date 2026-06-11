@@ -15,12 +15,14 @@ HERE = Path(__file__).resolve().parent
 
 # Version this script produces. A DB reporting a HIGHER version was written by
 # a newer brain — running an old migrator against it could silently downgrade.
-SCHEMA_VERSION = 3
+# v4 (2026-06): invalid_at (soft fact invalidation), abstract (L0 tier for
+# token-budgeted context injection), recall_log (re-extraction guard).
+SCHEMA_VERSION = 4
 
 # Tables created by SCHEMA_SQL / setup_vec_extension — used for dry-run planning.
 SCHEMA_TABLES = [
     "tags", "memory_tags", "type_aliases", "task_meta",
-    "memory_links", "memory_versions", "alterations",
+    "memory_links", "memory_versions", "alterations", "recall_log",
 ]
 VEC_TABLES = ["memory_vectors", "memory_chunks"]
 
@@ -33,6 +35,11 @@ NEW_COLUMNS = [
     ("version", "INTEGER NOT NULL DEFAULT 1"),
     ("superseded_by", "TEXT"),
     ("canonical_type", "TEXT"),
+    # v4: NULL = fact still true. Set = superseded/contradicted at that time;
+    # default queries filter these out, --as-of / --include-invalid see them.
+    ("invalid_at", "DATETIME"),
+    # v4: L0 tier — ~1-2 sentence abstract for token-budgeted `brain context`.
+    ("abstract", "TEXT"),
 ]
 
 # Everything below is pure CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS — safe to re-run.
@@ -127,6 +134,18 @@ CREATE TABLE IF NOT EXISTS alterations (
   reason      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_alterations_uid ON alterations(memory_uid);
+
+-- v4: which memories were recently surfaced into an agent's context.
+-- `brain reconcile` uses this as a re-extraction guard: a "new" fact that
+-- closely matches a recently-recalled memory is almost always the agent
+-- re-saving its own context (the Mem0 808-duplicate feedback loop).
+CREATE TABLE IF NOT EXISTS recall_log (
+  id           INTEGER PRIMARY KEY,
+  memory_id    INTEGER NOT NULL,
+  recalled_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_time ON recall_log(recalled_at);
+CREATE INDEX IF NOT EXISTS idx_recall_log_memory ON recall_log(memory_id);
 """
 
 TYPE_ALIASES = [
@@ -465,7 +484,7 @@ def main() -> int:
         print("    already porter — skipped")
 
     mark_schema_version(conn)
-    print("\n✓ schema v3 applied")
+    print(f"\n✓ schema v{SCHEMA_VERSION} applied")
     conn.close()
     return 0
 
