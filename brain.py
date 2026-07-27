@@ -123,7 +123,7 @@ _flags_cache: dict[str, bool] | None = None
 
 
 def _schema_flags(conn: sqlite3.Connection) -> dict[str, bool]:
-    """Which v4 columns exist. Lets new code run against un-migrated DBs
+    """Which v4/v5 columns exist. Lets new code run against un-migrated DBs
     (features quietly degrade instead of erroring on missing columns)."""
     global _flags_cache
     if _flags_cache is None:
@@ -131,8 +131,89 @@ def _schema_flags(conn: sqlite3.Connection) -> dict[str, bool]:
         _flags_cache = {
             "invalid_at": "invalid_at" in cols,
             "abstract": "abstract" in cols,
+            "identity_key": "identity_key" in cols,   # v5
+            "anchor": "anchor" in cols,               # v5
         }
     return _flags_cache
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v5: identity keys, feedback-weighted recall, pinned blocks
+# ────────────────────────────────────────────────────────────────────────────
+
+# Explicit-identity dedup. Borrowed from cognee's DataPoint: a node with a
+# random id can never merge across runs, so mergeable facts declare the fields
+# that define them and the key is derived deterministically from those.
+# Exact key, never a shared token or substring — a generic token betrays you
+# ("health" matching sutterhealth, "valley" matching two unrelated orgs).
+def identity_key(kind: str, value: str) -> str:
+    """Stable key for a fact that should merge instead of duplicating.
+
+    `kind` namespaces the value so two different fact-kinds sharing a value
+    (project "corena" vs person "corena") never collide.
+    """
+    norm = " ".join((value or "").split()).strip().lower()
+    if not norm:
+        return ""
+    return f"{kind.strip().lower()}:{hashlib.sha256(norm.encode()).hexdigest()[:16]}"
+
+
+def ensure_feedback_table(conn: sqlite3.Connection) -> None:
+    """Idempotent. Explicit usefulness signal per memory.
+
+    recall_log says a memory was *shown*; that is not the same as useful.
+    Cognee reweights graph edges from answer feedback — this is the flat-store
+    equivalent: an agent or human marks a recalled memory as having helped (or
+    misled), and ranking reflects it.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_feedback (
+            id        INTEGER PRIMARY KEY,
+            memory_id INTEGER NOT NULL,
+            signal    INTEGER NOT NULL,      -- +1 useful, -1 misleading
+            note      TEXT,
+            ts        TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id)"
+    )
+
+
+def ensure_blocks_table(conn: sqlite3.Connection) -> None:
+    """Idempotent. Pinned core blocks — tiny always-injected context.
+
+    Roadmap item 8. A handful of short labelled values (persona, hard rules,
+    current focus) that should ride along with EVERY context block regardless
+    of what the query matched. Hard char_limit per block so this can never
+    become the unbounded-injection problem it exists to avoid.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS blocks (
+            label      TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            char_limit INTEGER NOT NULL DEFAULT 400,
+            position   INTEGER NOT NULL DEFAULT 100,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+
+def _feedback_scores(conn: sqlite3.Connection, memory_ids: list[int]) -> dict[int, float]:
+    """Net feedback per memory, damped. Empty dict if the table does not exist
+    yet (pre-v5 DB) so ranking degrades to exactly the v4 behaviour."""
+    if not memory_ids:
+        return {}
+    try:
+        ph = ",".join("?" * len(memory_ids))
+        return {
+            r[0]: float(r[1] or 0)
+            for r in conn.execute(
+                f"SELECT memory_id, SUM(signal) FROM memory_feedback "
+                f"WHERE memory_id IN ({ph}) GROUP BY memory_id", memory_ids)
+        }
+    except sqlite3.OperationalError:
+        return {}
 
 
 def _log_recall(conn: sqlite3.Connection, memory_ids: list[int]) -> None:
@@ -468,6 +549,24 @@ def cmd_save(args) -> int:
         else:
             _warn("--abstract ignored — run `brain migrate` (schema v4)")
 
+    # v5: declared identity (deterministic merge key) and anchor (the entity a
+    # lesson is about). Both no-op on a pre-v5 DB.
+    flags = _schema_flags(conn)
+    ident = getattr(args, "identity", None)
+    if ident:
+        if flags.get("identity_key"):
+            cursor.execute("UPDATE memories SET identity_key = ? WHERE id = ?",
+                           (identity_key(ctype, ident), memory_id))
+        else:
+            _warn("--identity ignored — run `brain migrate` (schema v5)")
+    anchor = getattr(args, "anchor", None)
+    if anchor:
+        if flags.get("anchor"):
+            cursor.execute("UPDATE memories SET anchor = ? WHERE id = ?",
+                           (anchor.strip(), memory_id))
+        else:
+            _warn("--anchor ignored — run `brain migrate` (schema v5)")
+
     # Audit trail: record creation.
     log_alteration(conn, uid, "create", delta=title, reason=None)
 
@@ -510,6 +609,19 @@ def _build_filters(conn: sqlite3.Connection, args) -> tuple[str, list]:
 
 def _abstract_col(conn: sqlite3.Connection) -> str:
     return "m.abstract" if _schema_flags(conn)["abstract"] else "NULL AS abstract"
+
+
+def _anchor_col(conn: sqlite3.Connection) -> str:
+    return "m.anchor" if _schema_flags(conn).get("anchor") else "NULL AS anchor"
+
+
+def _row_get(row, key: str, default=None):
+    """sqlite3.Row has no .get(); columns also vary by schema version."""
+    try:
+        v = row[key]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
 
 
 def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
@@ -596,7 +708,7 @@ def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
     placeholders = ",".join("?" * len(candidate_ids))
     rows = cursor.execute(f"""
         SELECT m.id, m.uid, m.canonical_type AS type, m.title, m.content, m.project,
-               m.created_at, m.access_count, {_abstract_col(conn)}
+               m.created_at, m.access_count, {_abstract_col(conn)}, {_anchor_col(conn)}
         FROM memories m
         WHERE m.id IN ({placeholders}) AND m.deleted_at IS NULL{filter_sql}
     """, (*candidate_ids, *filter_params)).fetchall()
@@ -613,6 +725,7 @@ def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
     explain: dict[int, dict] | None = {} if want_explain else None
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     full = 2.0 / (RRF_K + 1)
+    fb = _feedback_scores(conn, list(by_id.keys()))
     scored = []
     for mid, r in by_id.items():
         rrf_fts = 1.0 / (RRF_K + fts_rank[mid] + 1) / full if mid in fts_rank else 0.0
@@ -623,7 +736,13 @@ def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
             age_days = 9999
         recency = 0.05 * math.exp(-max(age_days, 0) / 365.0)
         access = min(0.03, 0.01 * math.log1p(r["access_count"] or 0))
-        score = rrf_fts + rrf_sem + recency + access
+        # Feedback: signed, log-damped, capped at ±0.08 — big enough to reorder
+        # near-ties, never big enough to float an irrelevant memory above a
+        # genuine lexical/semantic hit. A downvoted memory is demoted, not
+        # hidden; invalidate is the tool for "this is wrong".
+        net = fb.get(mid, 0.0)
+        useful = math.copysign(min(0.08, 0.04 * math.log1p(abs(net))), net) if net else 0.0
+        score = rrf_fts + rrf_sem + recency + access + useful
         if explain is not None:
             explain[mid] = {
                 "fts_rank": fts_rank.get(mid),
@@ -632,6 +751,7 @@ def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
                 "rrf_fts": round(rrf_fts, 4), "rrf_sem": round(rrf_sem, 4),
                 "rrf": round(rrf_fts + rrf_sem, 4),
                 "recency_bonus": round(recency, 4), "access_bonus": round(access, 4),
+                "feedback_net": net, "feedback_bonus": round(useful, 4),
                 "final": round(score, 4),
             }
         scored.append((score, r))
@@ -646,10 +766,15 @@ def _explain_line(e: dict) -> str:
     fts = f"#{e['fts_rank'] + 1}" if e["fts_rank"] is not None else "-"
     sem = f"#{e['sem_rank'] + 1}" if e["sem_rank"] is not None else "-"
     sim = f"{e['sim']:.3f}" if e["sim"] is not None else "-"
+    # only show the feedback term when there IS feedback — keeps the common
+    # line unchanged and makes a reordering caused by feedback obvious
+    fbs = ""
+    if e.get("feedback_net"):
+        fbs = f"fb={e['feedback_net']:+g}({e['feedback_bonus']:+.3f}) "
     return (f"fts={fts} sem={sem} sim={sim} "
             f"rrf={e['rrf_fts']:.3f}+{e['rrf_sem']:.3f} "
             f"rec=+{e['recency_bonus']:.3f} acc=+{e['access_bonus']:.3f} "
-            f"= {e['final']:.3f}")
+            f"{fbs}= {e['final']:.3f}")
 
 
 def _print_results(top: list, conn: sqlite3.Connection, query: str, as_json: bool,
@@ -765,7 +890,24 @@ def cmd_context(args) -> int:
     budget_chars = max(args.budget, 100) * 4
     header = f"## Relevant memories (brain) — {query}"
     footer = "(full detail: `brain get <uid>`)"
-    used = len(header) + len(footer) + 2
+    # Pinned blocks come out of the SAME budget — they are always-injected, so
+    # if they were free they would be the unbounded-injection problem wearing a
+    # different hat. They win ties against matched memories (that is the point
+    # of pinning) but they cannot silently double the block size.
+    pinned = [] if getattr(args, "no_blocks", False) else _pinned_blocks(conn)
+    pin_lines = [f"- [{r['label']}] {r['value'][:r['char_limit']]}" for r in pinned]
+    pin_chars = sum(len(x) + 1 for x in pin_lines)
+    if pin_chars > budget_chars // 2 and pin_lines:
+        # never let pins eat more than half the budget
+        kept, acc = [], 0
+        for line in pin_lines:
+            if acc + len(line) + 1 > budget_chars // 2:
+                break
+            kept.append(line)
+            acc += len(line) + 1
+        _warn(f"pinned blocks trimmed {len(pin_lines)}→{len(kept)} to stay under half the budget")
+        pin_lines, pin_chars = kept, acc
+    used = len(header) + len(footer) + 2 + pin_chars
     entries = []
     for score, r in top:
         abstract = r["abstract"] or _auto_abstract(r["content"])
@@ -776,18 +918,127 @@ def cmd_context(args) -> int:
         used += len(line) + 1
 
     if args.json:
-        print(json.dumps([{
+        # Stays a flat LIST — agents already parse this shape, and turning it
+        # into an object would break them silently. Pinned blocks ride along as
+        # entries flagged `pinned`, so a consumer that ignores the flag sees
+        # exactly what it saw before.
+        out = [{
+            "uid": None, "type": "block", "title": r["label"],
+            "abstract": r["value"][:r["char_limit"]], "project": None,
+            "created_at": None, "score": None, "pinned": True,
+        } for r in pinned[:len(pin_lines)]]
+        out += [{
             "uid": r["uid"], "type": r["type"], "title": r["title"],
             "abstract": abstract, "project": r["project"],
+            "anchor": _row_get(r, "anchor"),
             "created_at": r["created_at"], "score": round(score, 3),
-        } for _, r, abstract, score in entries], ensure_ascii=False, indent=2))
+        } for _, r, abstract, score in entries]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
+        if pin_lines:
+            print("## Pinned (brain)")
+            for line in pin_lines:
+                print(line)
+            print()
         print(header)
-        for line, *_ in entries:
-            print(line)
+        # Group by anchor when the DB has them: entity-anchored lessons read as
+        # knowledge about a thing, where a flat list reads as trivia. Falls back
+        # to the flat list when nothing is anchored (pre-v5 or unanchored data).
+        anchored = [(line, r) for line, r, _, _ in entries
+                    if _schema_flags(conn).get("anchor") and _row_get(r, "anchor")]
+        if anchored and len(anchored) >= 2:
+            groups: dict[str, list[str]] = {}
+            for line, r in anchored:
+                groups.setdefault(_row_get(r, "anchor"), []).append(line)
+            done = {id(line) for line, _ in anchored}
+            for anchor in sorted(groups):
+                print(f"### {anchor}")
+                for line in groups[anchor]:
+                    print(line)
+            rest = [line for line, *_ in entries if id(line) not in done]
+            if rest:
+                print("### other")
+                for line in rest:
+                    print(line)
+        else:
+            for line, *_ in entries:
+                print(line)
         print(footer)
 
     _log_recall(conn, [r["id"] for _, r, _, _ in entries])
+    return 0
+
+
+def cmd_feedback(args) -> int:
+    """Mark a recalled memory as useful (+1) or misleading (-1).
+
+    This is the signal cognee gets from answer ratings and uses to reweight
+    graph edges; here it is a small, capped additive term in ranking. Kept
+    deliberately blunt — one integer per event, no decay model — because the
+    interesting question is whether the signal helps at all, and a simple
+    counter is auditable.
+    """
+    conn = connect()
+    ensure_feedback_table(conn)
+    row = conn.execute(
+        "SELECT id, title FROM memories WHERE uid = ? AND deleted_at IS NULL",
+        (args.uid,)).fetchone()
+    if not row:
+        return _err(f"no memory with uid {args.uid}")
+    signal = 1 if args.signal == "up" else -1
+    conn.execute(
+        "INSERT INTO memory_feedback(memory_id, signal, note) VALUES (?,?,?)",
+        (row["id"], signal, args.note))
+    conn.commit()
+    net = conn.execute(
+        "SELECT COALESCE(SUM(signal),0) FROM memory_feedback WHERE memory_id = ?",
+        (row["id"],)).fetchone()[0]
+    print(f"{'👍' if signal > 0 else '👎'} {args.uid} — {row['title'][:60]} (net {net:+d})")
+    return 0
+
+
+def _pinned_blocks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    try:
+        return list(conn.execute(
+            "SELECT label, value, char_limit FROM blocks ORDER BY position, label"))
+    except sqlite3.OperationalError:
+        return []
+
+
+def cmd_block(args) -> int:
+    """Manage pinned core blocks (always-injected context)."""
+    conn = connect()
+    ensure_blocks_table(conn)
+    action = args.action
+    if action == "set":
+        if not args.value:
+            return _err("value required: brain block set <label> \"<value>\"")
+        val = args.value
+        if len(val) > args.char_limit:
+            _warn(f"value {len(val)} chars > limit {args.char_limit}; truncating")
+            val = val[:args.char_limit]
+        conn.execute("""
+            INSERT INTO blocks(label, value, char_limit, position, updated_at)
+            VALUES (?,?,?,?, datetime('now'))
+            ON CONFLICT(label) DO UPDATE SET
+                value=excluded.value, char_limit=excluded.char_limit,
+                position=excluded.position, updated_at=datetime('now')
+        """, (args.label, val, args.char_limit, args.position))
+        conn.commit()
+        print(f"pinned [{args.label}] ({len(val)}/{args.char_limit} chars)")
+    elif action == "rm":
+        cur = conn.execute("DELETE FROM blocks WHERE label = ?", (args.label,))
+        conn.commit()
+        print(f"removed [{args.label}]" if cur.rowcount else f"no block [{args.label}]")
+    else:  # list
+        rows = _pinned_blocks(conn)
+        if not rows:
+            print("(no pinned blocks — brain block set <label> \"<value>\")")
+            return 0
+        total = sum(len(r["value"]) for r in rows)
+        for r in rows:
+            print(f"[{r['label']}] ({len(r['value'])}/{r['char_limit']}) {r['value']}")
+        print(f"\n{len(rows)} block(s), {total} chars (~{total // 4} tokens) injected per context")
     return 0
 
 
@@ -1016,6 +1267,20 @@ SIM_UPDATE = 0.85          # ≥ this → same topic, merge into the neighbor
 SIM_REVIEW = 0.70          # ≥ this → ambiguous, agent must look
 
 
+def _save_ns(**kw) -> argparse.Namespace:
+    """Namespace with every field cmd_save reads, so programmatic callers
+    (reconcile --auto, review) cannot AttributeError when save grows a flag."""
+    base = dict(
+        type="note", title="", content="", project="", area="", tags=[],
+        source_file="", force=False, no_embed=False, abstract=None,
+        identity=None, anchor=None,
+        status=None, priority=None, energy=None, points=None,
+        due_at=None, external_ref=None, parent_uid=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
 def _reconcile_decide(conn, cursor, title: str, content: str, args) -> dict:
     """The AUDN decision core: candidate fact → suggestion packet.
     Shared by `brain reconcile` (agent-facing) and `brain harvest` (automatic)."""
@@ -1026,6 +1291,17 @@ def _reconcile_decide(conn, cursor, title: str, content: str, args) -> dict:
         f"SELECT uid FROM memories WHERE content_hash = ? AND deleted_at IS NULL{invalid_sql} LIMIT 1",
         (h,),
     ).fetchone()
+
+    # Declared identity beats every similarity heuristic. If the caller said
+    # "this fact IS the deploy-runbook for corena", there is exactly one such
+    # memory by construction and a near-miss embedding cannot override that.
+    ident = getattr(args, "identity", None)
+    ikey = identity_key(getattr(args, "type", "note"), ident) if ident else ""
+    ident_hit = None
+    if ikey and flags.get("identity_key"):
+        ident_hit = cursor.execute(
+            f"SELECT uid FROM memories WHERE identity_key = ? AND deleted_at IS NULL"
+            f"{invalid_sql} LIMIT 1", (ikey,)).fetchone()
 
     filter_sql, filter_params = _build_filters(conn, args)
     top, explain = _hybrid_search(
@@ -1047,6 +1323,11 @@ def _reconcile_decide(conn, cursor, title: str, content: str, args) -> dict:
     best_sim = (best or {}).get("sim") or 0.0
     if exact:
         suggestion, reason, target = "noop", f"exact content_hash duplicate of {exact['uid']}", exact["uid"]
+    elif ident_hit:
+        suggestion, reason, target = "update", (
+            f"identity '{ident}' is already held by {ident_hit['uid']} — "
+            f"same fact by declaration, not by similarity; "
+            f"`brain update {ident_hit['uid']} --content \"...\"`"), ident_hit["uid"]
     elif best and best_sim >= SIM_NOOP_RECALLED and best["recalled_recently"]:
         suggestion, reason, target = "noop", (
             f"{best['uid']} (sim {best_sim:.2f}) was recalled into context in the last 24h — "
@@ -1065,7 +1346,8 @@ def _reconcile_decide(conn, cursor, title: str, content: str, args) -> dict:
 
     return {
         "suggestion": suggestion, "reason": reason, "target_uid": target,
-        "candidate": {"title": title, "content_hash": h, "type": getattr(args, "type", "note")},
+        "candidate": {"title": title, "content_hash": h, "type": getattr(args, "type", "note"),
+                      "identity": ident, "identity_key": ikey or None},
         "neighbors": neighbors,
     }
 
@@ -1097,13 +1379,12 @@ def cmd_reconcile(args) -> int:
 
     if args.auto:
         if suggestion == "add":
-            return cmd_save(argparse.Namespace(
+            return cmd_save(_save_ns(
                 type=args.type, title=title, content=content,
-                project=args.project, area="", tags=args.tags,
-                source_file="", force=False, no_embed=args.no_embed,
+                project=args.project, tags=args.tags, no_embed=args.no_embed,
                 abstract=getattr(args, "abstract", None),
-                status=None, priority=None, energy=None, points=None,
-                due_at=None, external_ref=None, parent_uid=None,
+                identity=getattr(args, "identity", None),
+                anchor=getattr(args, "anchor", None),
             ))
         print(json.dumps(packet, ensure_ascii=False, indent=2), file=sys.stderr)
         if suggestion == "noop":
@@ -1132,17 +1413,310 @@ secrets/credentials (never copy a secret value anywhere), and anything that
 reads like ALREADY-RECALLED memory (e.g. lines under "Relevant memories
 (brain)" or text citing brain uids) — those are echoes, not new knowledge.
 
+ANCHOR every fact to the ONE concrete entity it is about — the repo, service,
+client, person, or system it would be recalled alongside. A fact with no such
+entity is usually too vague to be worth keeping; prefer rewriting it as a
+lesson about a specific thing over emitting a floating generality.
+
 Output a JSON array, NOTHING else. Each item:
 {{"type": "learning|decision|bug|snippet|note",
   "title": "<concise, searchable, under 100 chars>",
   "content": "<the fact, self-contained, with its WHY>",
   "project": "<slug, default {project}>",
+  "anchor": "<the single entity this is about: repo/service/client/person>",
   "tags": "<3-5,comma,separated>",
   "abstract": "<one informative sentence>"}}
 Output [] if nothing qualifies. Maximum 5 items — pick the most durable.
 
 CONVERSATION DELTA:
 {conversation}"""
+
+
+REVIEW_PATH = Path.home() / ".config/brain/harvest-review.jsonl"
+
+# Auto-triage thresholds for `brain review --auto`. Deliberately conservative:
+# the queue exists because these cases were AMBIGUOUS, so auto-resolution only
+# touches the two ends where the packet is not actually ambiguous at all.
+AUTO_DROP_SIM = 0.90    # ≥ this to a live neighbor → near-certain duplicate
+AUTO_KEEP_SIM = 0.72    # ≤ this → nothing close; the "review" call was noise
+
+
+# Durability gate for `brain review --judge`. Same standard as HARVEST_PROMPT's
+# REJECT clause, applied retroactively: reconcile only ever measured
+# DUPLICATION, so queued candidates were never re-checked for whether they are
+# worth keeping at all. An audit of 40 of the 780 auto-savable candidates on
+# 2026-07-27 found 27% transient junk (point-in-time status, phase tracking,
+# lead counts) — and best-neighbor similarity did NOT separate it from the good
+# ones (0.546 vs 0.569), so no threshold tuning can substitute for this pass.
+JUDGE_PROMPT = """You are auditing candidate memories before they are written into a personal
+long-term knowledge DB used by coding agents. The bar: will this still be
+USEFUL TO RECALL IN 1+ MONTHS?
+
+USABLE = durable knowledge: root causes, decisions and WHY, bug
+symptom/cause/fix, configs/IDs/paths that persist, hard-won gotchas,
+ownership facts, verified conclusions.
+
+JUNK = transient task state, plans not yet executed, restated instructions,
+tool-output noise, ephemeral status ("now running", "phase 3 shipped"),
+point-in-time counts/metrics that decay, vague generalities with no specific
+subject, specs derivable from code or tickets.
+
+Be strict — this DB already has a junk problem.
+
+Output ONLY a JSON array, one object per item, no prose and no code fences:
+{{"i": <index>, "verdict": "usable"|"junk"}}
+
+ITEMS:
+{items}"""
+
+JUDGE_BATCH = 40
+
+
+def _judge_durability(cands: list[dict], model: str) -> set[int]:
+    """Indices judged JUNK. Fails SAFE: a failed/unparseable batch returns no
+    junk for that batch, so a model hiccup can never silently delete facts."""
+    import subprocess
+    import tempfile
+
+    junk: set[int] = set()
+    for start in range(0, len(cands), JUDGE_BATCH):
+        batch = cands[start:start + JUDGE_BATCH]
+        payload = json.dumps([
+            {"i": start + n, "type": c.get("type"), "title": c.get("title"),
+             "content": (c.get("content") or "")[:700], "project": c.get("project")}
+            for n, c in enumerate(batch)
+        ], ensure_ascii=False, indent=1)
+        env = {**os.environ, "BRAIN_HARVEST": "1"}
+        try:
+            r = subprocess.run(
+                ["claude", "-p", JUDGE_PROMPT.format(items=payload), "--model", model],
+                capture_output=True, text=True, timeout=300,
+                cwd=tempfile.gettempdir(), env=env,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            _warn(f"judge batch @{start} failed ({e}) — keeping all of it")
+            continue
+        if r.returncode != 0:
+            _warn(f"judge batch @{start} exited {r.returncode} — keeping all of it")
+            continue
+        m = re.search(r"\[.*\]", r.stdout, re.S)
+        if not m:
+            _warn(f"judge batch @{start} returned no JSON — keeping all of it")
+            continue
+        try:
+            verdicts = json.loads(m.group(0))
+        except ValueError:
+            _warn(f"judge batch @{start} returned bad JSON — keeping all of it")
+            continue
+        seen = 0
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            i = v.get("i")
+            if isinstance(i, int) and start <= i < start + len(batch):
+                seen += 1
+                if str(v.get("verdict", "")).lower() == "junk":
+                    junk.add(i)
+        print(f"  judged {start + len(batch)}/{len(cands)} "
+              f"({len(junk)} junk so far)", file=sys.stderr)
+    return junk
+
+
+def _review_load(path: Path) -> list[dict]:
+    """Read the queue. Skips malformed lines rather than dying — this file is
+    appended to by a background hook and a single bad line must not block the
+    whole backlog."""
+    items, bad = [], 0
+    if not path.exists():
+        return []
+    for i, line in enumerate(path.read_text().splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            d["_line"] = i
+            items.append(d)
+        except json.JSONDecodeError:
+            bad += 1
+    if bad:
+        _warn(f"{bad} malformed line(s) in {path} skipped")
+    return items
+
+
+def _review_rewrite(path: Path, keep: list[dict]) -> None:
+    """Atomic rewrite (same pattern as the rest of the file's writes)."""
+    tmp = path.with_suffix(".jsonl.tmp")
+    with open(tmp, "w") as f:
+        for d in keep:
+            d.pop("_line", None)
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def cmd_review(args) -> int:
+    """Triage the harvest review queue — the ambiguous candidates `brain
+    harvest` refused to decide alone.
+
+    Without this the queue is write-only: 993 entries had accumulated by
+    2026-07-26 with no way to drain them, which quietly made the
+    reconcile-gated capture pipeline lossy.
+
+      brain review                 summary + the next N packets
+      brain review --auto          resolve only the unambiguous ends
+      brain review --resolve <n> --action drop|save|update --uid <uid>
+      brain review --clear         drop everything (asks for --yes)
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    path = Path(args.file) if args.file else REVIEW_PATH
+    items = _review_load(path)
+    if not items:
+        print(f"review queue empty ({path})")
+        return 0
+
+    def best_sim(d: dict) -> float:
+        ns = (d.get("packet") or {}).get("neighbors") or []
+        sims = [n.get("sim") for n in ns if isinstance(n.get("sim"), (int, float))]
+        return max(sims) if sims else 0.0
+
+    if args.clear:
+        if not args.yes:
+            return _err(f"--clear drops all {len(items)} queued candidates; re-run with --yes")
+        _review_rewrite(path, [])
+        print(f"cleared {len(items)} queued candidate(s)")
+        return 0
+
+    if args.resolve is not None:
+        idx = args.resolve
+        if not (0 <= idx < len(items)):
+            return _err(f"index {idx} out of range (0..{len(items) - 1})")
+        d = items[idx]
+        cand = d.get("candidate") or {}
+        if args.action == "drop":
+            pass
+        elif args.action == "save":
+            if cmd_save(_save_ns(
+                type=cand.get("type", "note"), title=cand.get("title", ""),
+                content=cand.get("content", ""), project=cand.get("project") or "",
+                tags=cand.get("tags") or [], abstract=cand.get("abstract"),
+            )) != 0:
+                return _err("save failed; queue left untouched")
+        elif args.action == "update":
+            if not args.uid:
+                return _err("--action update needs --uid <target>")
+            if cmd_update(argparse.Namespace(
+                uid=args.uid, append=cand.get("content", ""), replace=None,
+                abstract=None, reason="merged from harvest review queue",
+            )) != 0:
+                return _err("update failed; queue left untouched")
+        else:
+            return _err("--action must be drop|save|update")
+        _review_rewrite(path, [x for i, x in enumerate(items) if i != idx])
+        print(f"resolved #{idx} ({args.action}) — {len(items) - 1} left in queue")
+        return 0
+
+    if args.auto:
+        # Pass 1 — DUPLICATION (reconcile, no LLM). Splits the queue three ways.
+        dropped = 0
+        savable: list[tuple[dict, dict]] = []   # (queue entry, candidate)
+        ambiguous: list[tuple[dict, dict]] = []
+        for d in items:
+            cand = d.get("candidate") or {}
+            title = (cand.get("title") or "").strip()
+            content = (cand.get("content") or "").strip()
+            if not title:
+                dropped += 1          # unusable entry
+                continue
+            # re-decide against the CURRENT db — most of this backlog was
+            # queued weeks ago and the neighbourhood has moved since
+            ns = argparse.Namespace(type=cand.get("type", "note"), project=None,
+                                    tags=None, no_semantic=args.no_semantic,
+                                    identity=None, since=None, until=None)
+            packet = _reconcile_decide(conn, cursor, title, content, ns)
+            sim = 0.0
+            for n in packet["neighbors"]:
+                if isinstance(n.get("sim"), (int, float)):
+                    sim = max(sim, n["sim"])
+            if packet["suggestion"] == "noop" or sim >= AUTO_DROP_SIM:
+                dropped += 1
+            elif packet["suggestion"] == "add" and sim <= AUTO_KEEP_SIM:
+                savable.append((d, cand))
+            else:
+                ambiguous.append((d, cand))
+
+        # Pass 2 — DURABILITY (one LLM pass). Orthogonal to pass 1: similarity
+        # cannot tell a durable fact from a transient status line. Junk is
+        # dropped from BOTH buckets; ambiguous survivors stay queued because
+        # what makes them ambiguous is duplication, which this pass never saw.
+        judged_junk_save: set[int] = set()
+        judged_junk_amb: set[int] = set()
+        if args.judge:
+            print(f"judging {len(savable)} savable + {len(ambiguous)} ambiguous "
+                  f"candidate(s) for durability ({args.model})…", file=sys.stderr)
+            judged_junk_save = _judge_durability([c for _, c in savable], args.model)
+            judged_junk_amb = _judge_durability([c for _, c in ambiguous], args.model)
+
+        saved = 0
+        keep: list[dict] = []
+        for i, (d, cand) in enumerate(savable):
+            if i in judged_junk_save:
+                dropped += 1
+                continue
+            if args.dry_run:
+                saved += 1
+                continue
+            if cmd_save(_save_ns(
+                type=cand.get("type", "note"), title=cand.get("title", "").strip(),
+                content=(cand.get("content") or "").strip(),
+                project=cand.get("project") or "", abstract=cand.get("abstract"),
+                tags=cand.get("tags") or [], anchor=cand.get("anchor"),
+            )) == 0:
+                saved += 1
+            else:
+                keep.append(d)        # save failed → leave it queued, retry later
+        for i, (d, _cand) in enumerate(ambiguous):
+            if i in judged_junk_amb:
+                dropped += 1
+                continue
+            keep.append(d)
+
+        judged_note = (f", {len(judged_junk_save) + len(judged_junk_amb)} killed by the "
+                       f"durability judge" if args.judge else "")
+        if args.dry_run:
+            print(f"DRY RUN: would drop {dropped}{judged_note}, save {saved}, "
+                  f"leave {len(keep)} for manual review (of {len(items)})")
+            return 0
+        _review_rewrite(path, keep)
+        print(f"auto-triage: dropped {dropped}{judged_note}, saved {saved} durable+new, "
+              f"{len(keep)} still need a human (of {len(items)})")
+        return 0
+
+    # default: summarise + show the next N packets
+    buckets = {"near-dup (≥0.90)": 0, "ambiguous": 0, "looks new (≤0.72)": 0}
+    for d in items:
+        s = best_sim(d)
+        buckets["near-dup (≥0.90)" if s >= AUTO_DROP_SIM else
+                "looks new (≤0.72)" if s <= AUTO_KEEP_SIM else "ambiguous"] += 1
+    print(f"review queue: {len(items)} candidate(s) — {path}")
+    for k, v in buckets.items():
+        print(f"  {k:<20} {v}")
+    print(f"\n  brain review --auto            resolve the {buckets['near-dup (≥0.90)'] + buckets['looks new (≤0.72)']} unambiguous ones")
+    print("  brain review --auto --dry-run  preview that first")
+    print()
+
+    if args.json:
+        print(json.dumps(items[:args.limit], ensure_ascii=False, indent=2))
+        return 0
+    for i, d in enumerate(items[:args.limit]):
+        cand = d.get("candidate") or {}
+        print(f"[{i}] ({cand.get('type', '?')}) {cand.get('title', '')[:78]}")
+        print(f"     best neighbor sim {best_sim(d):.2f} · project={cand.get('project')}")
+        for n in ((d.get("packet") or {}).get("neighbors") or [])[:2]:
+            sim = n.get("sim")
+            print(f"       ~ {n.get('uid')} {sim if sim is None else f'{sim:.2f}'} {str(n.get('title'))[:56]}")
+        print(f"     resolve: brain review --resolve {i} --action drop|save|update --uid <uid>")
+    return 0
 
 
 def ensure_harvest_table(conn: sqlite3.Connection) -> None:
@@ -1287,15 +1861,15 @@ def cmd_harvest(args) -> int:
             project=str(c.get("project", project)),
             tags=[str(c.get("tags", ""))] if c.get("tags") else [],
             abstract=str(c.get("abstract", "")) or None,
+            anchor=str(c.get("anchor", "")).strip() or None,
+            identity=None,
             no_semantic=args.no_semantic, no_embed=False,
         )
         packet = _reconcile_decide(conn, cursor, title, content, ns)
         if packet["suggestion"] == "add":
-            rc = cmd_save(argparse.Namespace(
-                **{**vars(ns), "area": "", "source_file": f"harvest:{path.name}",
-                   "force": False, "status": None, "priority": None, "energy": None,
-                   "points": None, "due_at": None, "external_ref": None,
-                   "parent_uid": None}))
+            rc = cmd_save(_save_ns(
+                **{k: v for k, v in vars(ns).items() if k != "no_semantic"},
+                source_file=f"harvest:{path.name}"))
             (added if rc == 0 else noops).append(title)
         elif packet["suggestion"] == "noop":
             noops.append(title)
@@ -1793,6 +2367,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tags", action="append", default=[], help="comma-separated; can repeat flag")
     s.add_argument("--source-file", default="")
     s.add_argument("--abstract", help="~1-sentence L0 summary used by `brain context`")
+    s.add_argument("--identity", help="declared merge key (e.g. \"corena deploy runbook\") — "
+                                      "at most one live memory may hold it; reconcile merges on it")
+    s.add_argument("--anchor", help="entity this is about (client/repo/person/system) — "
+                                    "groups lessons in `brain context`")
     s.add_argument("--force", action="store_true", help="bypass dedup")
     s.add_argument("--no-embed", action="store_true", help="skip embedding")
     # task-only:
@@ -1829,8 +2407,46 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--since-days", type=int)
     s.add_argument("--no-semantic", action="store_true")
+    s.add_argument("--no-blocks", action="store_true", help="omit pinned core blocks")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context)
+
+    # feedback
+    s = sub.add_parser("feedback",
+                       help="Mark a memory as useful/misleading — feeds search ranking")
+    s.add_argument("uid")
+    s.add_argument("signal", choices=["up", "down"])
+    s.add_argument("--note", help="why (stored, not used in ranking)")
+    s.set_defaults(func=cmd_feedback)
+
+    # block (pinned core context)
+    s = sub.add_parser("block", help="Pinned core blocks injected into every `brain context`")
+    s.add_argument("action", choices=["set", "list", "rm"], nargs="?", default="list")
+    s.add_argument("label", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.add_argument("--char-limit", type=int, default=400)
+    s.add_argument("--position", type=int, default=100, help="sort order (lower = first)")
+    s.set_defaults(func=cmd_block)
+
+    # review (harvest queue triage)
+    s = sub.add_parser("review", help="Triage the harvest review queue (ambiguous candidates)")
+    s.add_argument("--limit", type=int, default=10, help="packets to show (default 10)")
+    s.add_argument("--auto", action="store_true",
+                   help="resolve only the unambiguous ends (drop near-dups, save clearly-new)")
+    s.add_argument("--judge", action="store_true",
+                   help="with --auto: add an LLM durability pass — drops transient junk "
+                        "that similarity cannot detect (~27%% of otherwise-savable candidates)")
+    s.add_argument("--model", default="sonnet", help="model for --judge (default sonnet)")
+    s.add_argument("--dry-run", action="store_true", help="with --auto: report, change nothing")
+    s.add_argument("--resolve", type=int, metavar="N", help="resolve queue entry N")
+    s.add_argument("--action", choices=["drop", "save", "update"], help="with --resolve")
+    s.add_argument("--uid", help="with --resolve --action update: merge target")
+    s.add_argument("--clear", action="store_true", help="drop the whole queue (needs --yes)")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--file", help="queue path (default ~/.config/brain/harvest-review.jsonl)")
+    s.add_argument("--no-semantic", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_review)
 
     # reconcile
     s = sub.add_parser("reconcile",
@@ -1841,6 +2457,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project", default="")
     s.add_argument("--tags", action="append", default=[])
     s.add_argument("--abstract")
+    s.add_argument("--identity", help="declared merge key — an existing holder forces 'update'")
+    s.add_argument("--anchor", help="entity this fact is about")
     s.add_argument("--auto", action="store_true",
                    help="apply 'add' directly; exit 2 on noop, 3 when the agent must decide")
     s.add_argument("--no-embed", action="store_true")

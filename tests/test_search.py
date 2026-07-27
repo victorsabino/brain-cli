@@ -14,7 +14,9 @@ import sys
 from conftest import EVAL, run_brain
 
 EXPLAIN_KEYS = {"fts_rank", "sem_rank", "sim", "rrf_fts", "rrf_sem", "rrf",
-                "recency_bonus", "access_bonus", "final"}
+                "recency_bonus", "access_bonus",
+                "feedback_net", "feedback_bonus",   # v5
+                "final"}
 
 
 def test_eval_gate_fts_only(fixture_db):
