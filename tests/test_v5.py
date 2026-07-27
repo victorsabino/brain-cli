@@ -437,3 +437,107 @@ def test_anchor_backfill_fails_safe(db, tmp_path):
     _save(db, "epsilon memory", "epsilon body")
     r = run_brain(db, "anchor", "--no-embed", env_extra=_stub_claude(tmp_path, "garbage"))
     assert r.returncode == 0 and "1 left unanchored" in r.stdout
+
+
+# ── secrets extraction ──────────────────────────────────────────────────────
+
+FAKE_AWS = "AKIA" + "Q" * 16
+FAKE_GH = "ghp_" + "z" * 30
+
+
+def test_secrets_scan_reports_without_printing_values(db, tmp_path):
+    _save(db, "aws runbook", f"use key {FAKE_AWS} for the dev account")
+    r = run_brain(db, "secrets")
+    assert r.returncode == 0
+    assert "aws_access_key_id" in r.stdout
+    assert FAKE_AWS not in r.stdout, "scan must never print the secret value"
+
+
+def test_secrets_extract_moves_value_to_env_and_references_it(db, tmp_path):
+    envf = tmp_path / "secrets.env"
+    uid = _save(db, "aws runbook", f"use key {FAKE_AWS} for the dev account")
+    r = run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert r.returncode == 0, r.stderr
+    # value preserved in the env file
+    assert FAKE_AWS in envf.read_text()
+    assert oct(envf.stat().st_mode)[-3:] == "600"
+    # content now references it, value gone
+    got = run_brain(db, "get", uid).stdout
+    assert FAKE_AWS not in got
+    assert "${AWS_ACCESS_KEY_ID_1}" in got
+
+
+def test_secrets_same_value_gets_one_var(db, tmp_path):
+    envf = tmp_path / "secrets.env"
+    _save(db, "runbook one", f"key {FAKE_AWS} here")
+    _save(db, "runbook two", f"same key {FAKE_AWS} again")
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    body = envf.read_text()
+    assert body.count(FAKE_AWS) == 1, "one distinct value must map to one variable"
+    assert "AWS_ACCESS_KEY_ID_2" not in body
+
+
+def test_secrets_extract_is_idempotent(db, tmp_path):
+    envf = tmp_path / "secrets.env"
+    _save(db, "aws runbook", f"key {FAKE_AWS} here")
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    first = envf.read_text()
+    r = run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert "no secret-looking values" in r.stdout
+    assert envf.read_text() == first
+
+
+def test_secrets_dry_run_changes_nothing(db, tmp_path):
+    envf = tmp_path / "secrets.env"
+    uid = _save(db, "gh runbook", f"token {FAKE_GH} for pushes")
+    r = run_brain(db, "secrets", "--extract", "--dry-run", "--env-file", str(envf))
+    assert "DRY RUN" in r.stdout and not envf.exists()
+    assert FAKE_GH in run_brain(db, "get", uid).stdout
+
+
+def test_secrets_leaves_innocent_content_alone(db, tmp_path):
+    envf = tmp_path / "secrets.env"
+    uid = _save(db, "plain note", "just a normal sentence about deployment steps")
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert "normal sentence about deployment" in run_brain(db, "get", uid).stdout
+
+
+def test_secrets_matches_tokens_containing_dashes_and_underscores(db, tmp_path):
+    """Regression: `secret_[A-Za-z0-9]{20,}` stopped at the first '-', so real
+    tokens survived and the follow-up scan reported 'no secrets' falsely."""
+    envf = tmp_path / "s.env"
+    tok = "secret_plB3nYUn-_oK7GfmVHwvI5hzsm8hOu9x9e-MPPTtSw0"
+    uid = _save(db, "creds note", f"Secret: {tok} for the portal")
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    got = run_brain(db, "get", uid).stdout
+    assert tok not in got, "hyphenated token must be fully replaced"
+    assert "${SCOUT_ORG_SECRET_1}" in got
+    assert tok in envf.read_text()
+
+
+def test_secrets_does_not_eat_long_ids_in_urls(db, tmp_path):
+    """Regression: an unanchored `A[A-Za-z0-9_-]{40,}` matched opaque resource
+    IDs inside URLs. High-entropy patterns must be context-anchored."""
+    envf = tmp_path / "s.env"
+    url = "https://api-prod.scoutos.com/world/Acmc5ay7sm01k00hs6rs9yvwdiZZQQmmxx11/_interact_sync"
+    uid = _save(db, "api runbook", f"POST {url} to fire the agent")
+    r = run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert "no secret-looking values" in r.stdout or not envf.exists()
+    assert url in run_brain(db, "get", uid).stdout, "URL path id must be untouched"
+
+
+def test_secrets_bearer_token_is_extracted(db, tmp_path):
+    envf = tmp_path / "s.env"
+    tok = "AYpQ" + "x" * 40 + "=="
+    uid = _save(db, "curl runbook", f'curl -H "Authorization: Bearer {tok}" https://x.dev')
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert tok not in run_brain(db, "get", uid).stdout
+    assert "${BEARER_TOKEN_1}" in run_brain(db, "get", uid).stdout
+
+
+def test_secrets_leaves_placeholders_alone(db, tmp_path):
+    """A placeholder rewritten to ${VAR} destroys the instruction."""
+    envf = tmp_path / "s.env"
+    uid = _save(db, "setup doc", 'export KEY="<YOUR_TOKEN_HERE_PUT_IT_HERE_NOW>"')
+    run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
+    assert "YOUR_TOKEN_HERE" in run_brain(db, "get", uid).stdout
