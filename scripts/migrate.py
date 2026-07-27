@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 # v5 (2026-07): identity_key (declared merge key — exact, not similarity),
 # anchor (the entity a lesson is about), memory_feedback (usefulness signal
 # feeding ranking), blocks (pinned always-injected context).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Tables created by SCHEMA_SQL / setup_vec_extension — used for dry-run planning.
 SCHEMA_TABLES = [
@@ -344,11 +344,25 @@ def setup_vec_extension(conn: sqlite3.Connection) -> bool:
 
 
 def fts_needs_rebuild(conn: sqlite3.Connection) -> bool:
-    """True when memories_fts is missing or not yet porter-tokenized."""
+    """True when memories_fts is missing, not porter-tokenized, or predates the
+    v6 `anchor` column.
+
+    v6: anchor was added to `memories` in v5 but indexed NOWHERE — not in FTS
+    (title/content/tags/project/type) and not in the embedded chunk text
+    (title + content). So it only affected `context` grouping and could not
+    help retrieval at all. Indexing it is the whole point: an anchor is the
+    short entity token that disambiguates a dense cluster of sibling memories
+    when you cannot recall the distinctive proper noun.
+
+    `abstract` is deliberately NOT indexed: it is a restatement of content, so
+    indexing it would double term frequencies for summarized memories and skew
+    BM25 toward whichever memories happen to have an abstract.
+    """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE name = 'memories_fts' AND type = 'table'"
     ).fetchone()
-    return not (row and "porter" in (row[0] or ""))
+    sql = (row[0] or "") if row else ""
+    return not (row and "porter" in sql and "anchor" in sql)
 
 
 def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
@@ -366,23 +380,23 @@ def rebuild_fts_porter(conn: sqlite3.Connection) -> bool:
         DROP TRIGGER IF EXISTS memories_ad;
         DROP TABLE IF EXISTS memories_fts;
         CREATE VIRTUAL TABLE memories_fts USING fts5(
-          title, content, tags, project, type,
+          title, content, tags, project, type, anchor,
           content=memories, content_rowid=rowid,
           tokenize='porter unicode61'
         );
         CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
-          INSERT INTO memories_fts(rowid, title, content, tags, project, type)
-          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type);
+          INSERT INTO memories_fts(rowid, title, content, tags, project, type, anchor)
+          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type, new.anchor);
         END;
         CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
-          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type)
-          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type);
-          INSERT INTO memories_fts(rowid, title, content, tags, project, type)
-          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type);
+          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type, anchor)
+          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type, old.anchor);
+          INSERT INTO memories_fts(rowid, title, content, tags, project, type, anchor)
+          VALUES (new.rowid, new.title, new.content, new.tags, new.project, new.type, new.anchor);
         END;
         CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
-          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type)
-          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type);
+          INSERT INTO memories_fts(memories_fts, rowid, title, content, tags, project, type, anchor)
+          VALUES ('delete', old.rowid, old.title, old.content, old.tags, old.project, old.type, old.anchor);
         END;
         INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
     """)
