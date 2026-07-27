@@ -360,3 +360,80 @@ def test_auto_without_judge_does_not_call_llm(db, tmp_path):
                   env_extra=_stub_claude(tmp_path, "boom", exit_code=1))
     assert r.returncode == 0 and "save 2" in r.stdout
     assert "durability judge" not in r.stdout
+
+
+# ── v6: anchor is actually INDEXED (v5 stored it but indexed it nowhere) ────
+
+def test_fts_indexes_anchor(db):
+    conn = sqlite3.connect(db)
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()[0]
+    conn.close()
+    assert "anchor" in ddl, "anchor must be an FTS column or it can never be retrieved"
+
+
+def test_anchor_is_searchable(db):
+    """The whole point of v6: find a memory by its anchor alone."""
+    _save(db, "shortened the page title", "changed the h1 text", anchor="corena")
+    r = run_brain(db, "search", "corena", "--json", "--no-semantic")
+    hits = json.loads(r.stdout)
+    assert any("shortened the page title" in h["title"] for h in hits), \
+        "anchor token must retrieve the memory even though it is not in title/content"
+
+
+def test_anchor_reaches_embedded_chunk_text(brain_mod):
+    texts = brain_mod.chunk_texts("some title", "some body", anchor="corena")
+    assert all("corena" in t for t in texts)
+    plain = brain_mod.chunk_texts("some title", "some body")
+    assert all("corena" not in t for t in plain)
+
+
+def test_anchor_update_refreshes_fts(db):
+    """Anchor set after insert must reach FTS via the trigger, not just the row."""
+    _save(db, "zzz obscure title", "zzz obscure body")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE memories SET anchor='falkor' WHERE title='zzz obscure title'")
+    conn.commit()
+    conn.close()
+    r = run_brain(db, "search", "falkor", "--json", "--no-semantic")
+    assert any("zzz obscure" in h["title"] for h in json.loads(r.stdout))
+
+
+def test_anchor_backfill_sets_and_skips(db, tmp_path):
+    _save(db, "alpha memory", "alpha body")
+    _save(db, "beta memory", "beta body")
+    verdicts = json.dumps([{"i": 0, "anchor": "Corena"}, {"i": 1, "anchor": None}])
+    r = run_brain(db, "anchor", "--no-embed",
+                  env_extra=_stub_claude(tmp_path, verdicts))
+    assert r.returncode == 0, r.stderr
+    assert "set 1 anchor" in r.stdout and "1 had no single entity" in r.stdout
+    conn = sqlite3.connect(db)
+    vals = [x[0] for x in conn.execute(
+        "SELECT anchor FROM memories WHERE anchor IS NOT NULL")]
+    conn.close()
+    assert vals == ["corena"], "anchors must be normalized lowercase for cluster consistency"
+
+
+def test_anchor_backfill_rejects_vague_buckets(db, tmp_path):
+    """A wrong anchor is worse than none — it merges unrelated clusters."""
+    _save(db, "gamma memory", "gamma body")
+    for bad in ("general", "misc", "N/A"):
+        r = run_brain(db, "anchor", "--no-embed",
+                      env_extra=_stub_claude(tmp_path, json.dumps([{"i": 0, "anchor": bad}])))
+        assert "set 0 anchor" in r.stdout, f"{bad!r} should be rejected"
+
+
+def test_anchor_backfill_dry_run_writes_nothing(db, tmp_path):
+    _save(db, "delta memory", "delta body")
+    r = run_brain(db, "anchor", "--dry-run", "--no-embed",
+                  env_extra=_stub_claude(tmp_path, json.dumps([{"i": 0, "anchor": "corena"}])))
+    assert "would set 1" in r.stdout
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM memories WHERE anchor IS NOT NULL").fetchone()[0] == 0
+    conn.close()
+
+
+def test_anchor_backfill_fails_safe(db, tmp_path):
+    _save(db, "epsilon memory", "epsilon body")
+    r = run_brain(db, "anchor", "--no-embed", env_extra=_stub_claude(tmp_path, "garbage"))
+    assert r.returncode == 0 and "1 left unanchored" in r.stdout

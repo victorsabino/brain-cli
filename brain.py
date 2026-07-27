@@ -407,12 +407,22 @@ def _split_chunks(content: str) -> list[str]:
     return chunks or [""]
 
 
-def chunk_texts(title: str, content: str) -> list[str]:
-    """Embeddable texts: title prepended to every chunk so each stays topical."""
-    return [f"{title}\n{c}" if c else title for c in _split_chunks(content)][:CHUNK_CAP]
+def chunk_texts(title: str, content: str, anchor: str | None = None) -> list[str]:
+    """Embeddable texts: title (and anchor) prepended to every chunk so each
+    stays topical.
+
+    v6: the anchor is the entity the fact is about. Without it in the embedded
+    text, a query that describes the situation but not the proper noun has
+    nothing to latch onto and sibling memories in the same cluster win — the
+    dominant failure mode in the 2026-07-27 reachability audit (vague-phrasing
+    recall@5 was 0.62 against 0.98 for keyword queries).
+    """
+    head = f"{anchor}\n{title}" if anchor else title
+    return [f"{head}\n{c}" if c else head for c in _split_chunks(content)][:CHUNK_CAP]
 
 
-def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: str) -> bool:
+def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: str,
+                 anchor: str | None = None) -> bool:
     """Write chunked embeddings into memory_chunks (cosine vec0).
 
     The model's effective window is ~128 tokens, so one vector per memory makes
@@ -427,7 +437,7 @@ def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: 
     model = get_embedder()
     if model is None or not _vec_loaded:
         return False
-    texts = chunk_texts(title, content)
+    texts = chunk_texts(title, content, anchor)
     try:
         vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         base = memory_id * CHUNK_CAP
@@ -456,7 +466,8 @@ def embed_memory(conn: sqlite3.Connection, memory_id: int, title: str, content: 
         return False
 
 
-def _embed_in_txn(conn, cursor, memory_id: int, title: str, content: str, uid: str) -> None:
+def _embed_in_txn(conn, cursor, memory_id: int, title: str, content: str, uid: str,
+                  anchor: str | None = None) -> None:
     """Embed inside the caller's OPEN transaction (savepoint-guarded).
 
     Atomicity: memory row + chunks commit together — no crash window where a
@@ -465,7 +476,7 @@ def _embed_in_txn(conn, cursor, memory_id: int, title: str, content: str, uid: s
     """
     cursor.execute("SAVEPOINT embed")
     try:
-        embed_memory(conn, memory_id, title, content)
+        embed_memory(conn, memory_id, title, content, anchor)
         cursor.execute("RELEASE SAVEPOINT embed")
     except Exception as e:
         cursor.execute("ROLLBACK TO SAVEPOINT embed")
@@ -572,7 +583,8 @@ def cmd_save(args) -> int:
 
     # Embed in the SAME transaction, then one commit (see _embed_in_txn).
     if not args.no_embed and _vec_loaded:
-        _embed_in_txn(conn, cursor, memory_id, title, content, uid)
+        _embed_in_txn(conn, cursor, memory_id, title, content, uid,
+                      anchor.strip() if anchor else None)
 
     conn.commit()
 
@@ -1719,6 +1731,110 @@ def cmd_review(args) -> int:
     return 0
 
 
+ANCHOR_PROMPT = """For each memory below, name the ONE concrete entity it is about — the repo,
+service, client, person, product, or system someone would recall it alongside.
+
+Rules:
+- A short noun phrase, lowercase, 1-3 words. Prefer the proper name when there
+  is one ("corena", "falkor", "brain.db", "unify", "spright").
+- Be CONSISTENT: the same entity must get byte-identical text every time.
+- If the memory is genuinely about no single entity, use null. Do not invent
+  a vague bucket like "general" or "misc" — a wrong anchor is worse than none,
+  because it will pull unrelated memories into the same cluster.
+
+Output ONLY a JSON array, no prose and no code fences:
+{{"i": <index>, "anchor": "<entity>"|null}}
+
+MEMORIES:
+{items}"""
+
+
+def cmd_anchor(args) -> int:
+    """Backfill `anchor` on memories that lack one.
+
+    Anchors only ever populated from new harvests, so the existing corpus had
+    ~1% coverage and the feature could not affect anything. This backfills it
+    in batches, then re-embeds the touched rows so the anchor actually reaches
+    the index (FTS picks it up automatically via the v6 triggers).
+    """
+    conn = connect(load_vec=True)
+    cursor = conn.cursor()
+    if not _schema_flags(conn).get("anchor"):
+        return _err("anchor column missing — run `brain migrate` (schema v5+)")
+
+    rows = cursor.execute(
+        "SELECT id, uid, canonical_type, title, content, project FROM memories "
+        "WHERE (anchor IS NULL OR anchor = '') AND deleted_at IS NULL "
+        "AND invalid_at IS NULL ORDER BY id DESC" + (f" LIMIT {int(args.limit)}" if args.limit else "")
+    ).fetchall()
+    if not rows:
+        print("every live memory already has an anchor")
+        return 0
+    print(f"backfilling anchors for {len(rows)} memories ({args.model})…", file=sys.stderr)
+
+    import subprocess
+    import tempfile
+
+    set_count, null_count, failed = 0, 0, 0
+    for start in range(0, len(rows), JUDGE_BATCH):
+        batch = rows[start:start + JUDGE_BATCH]
+        payload = json.dumps([
+            {"i": start + n, "type": r["canonical_type"], "title": r["title"],
+             "content": (r["content"] or "")[:400], "project": r["project"]}
+            for n, r in enumerate(batch)
+        ], ensure_ascii=False, indent=1)
+        env = {**os.environ, "BRAIN_HARVEST": "1"}
+        try:
+            res = subprocess.run(
+                ["claude", "-p", ANCHOR_PROMPT.format(items=payload), "--model", args.model],
+                capture_output=True, text=True, timeout=300,
+                cwd=tempfile.gettempdir(), env=env)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            _warn(f"anchor batch @{start} failed ({e}) — left unanchored")
+            failed += len(batch)
+            continue
+        m = re.search(r"\[.*\]", res.stdout, re.S) if res.returncode == 0 else None
+        if not m:
+            _warn(f"anchor batch @{start} unusable — left unanchored")
+            failed += len(batch)
+            continue
+        try:
+            out = json.loads(m.group(0))
+        except ValueError:
+            _warn(f"anchor batch @{start} bad JSON — left unanchored")
+            failed += len(batch)
+            continue
+
+        for v in out:
+            if not isinstance(v, dict):
+                continue
+            i = v.get("i")
+            if not (isinstance(i, int) and start <= i < start + len(batch)):
+                continue          # ignore indices the model invented
+            anchor = v.get("anchor")
+            anchor = " ".join(str(anchor).split()).lower()[:60] if anchor else ""
+            if not anchor or anchor in {"general", "misc", "none", "null", "n/a"}:
+                null_count += 1
+                continue
+            r = rows[i]
+            if not args.dry_run:
+                cursor.execute("UPDATE memories SET anchor = ? WHERE id = ?", (anchor, r["id"]))
+                # re-embed so the anchor reaches the vector side too; FTS is
+                # updated by the v6 trigger on this UPDATE automatically.
+                if not args.no_embed and _vec_loaded:
+                    embed_memory(conn, r["id"], r["title"] or "", r["content"] or "", anchor)
+            set_count += 1
+        if not args.dry_run:
+            conn.commit()
+        print(f"  {min(start + JUDGE_BATCH, len(rows))}/{len(rows)} "
+              f"({set_count} anchored)", file=sys.stderr)
+
+    verb = "would set" if args.dry_run else "set"
+    print(f"{verb} {set_count} anchor(s); {null_count} had no single entity; "
+          f"{failed} left unanchored (batch failure)")
+    return 0
+
+
 def ensure_harvest_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS harvest_state (
@@ -2152,7 +2268,8 @@ def cmd_reindex(args) -> int:
     conn.commit()
 
     rows = conn.execute(
-        "SELECT id, title, content FROM memories WHERE deleted_at IS NULL"
+        f"SELECT id, title, content, {_anchor_col(conn).replace('m.', '')} "
+        "FROM memories WHERE deleted_at IS NULL"
     ).fetchall()
     if not args.full:
         done = {r[0] for r in conn.execute("SELECT DISTINCT memory_id FROM memory_chunks")}
@@ -2160,7 +2277,8 @@ def cmd_reindex(args) -> int:
 
     print(f"→ embedding {len(rows)} memories (chunked)…")
     for i, r in enumerate(rows, 1):
-        embed_memory(conn, r["id"], r["title"] or "", r["content"] or "")
+        embed_memory(conn, r["id"], r["title"] or "", r["content"] or "",
+                     _row_get(r, "anchor"))
         conn.commit()  # embed_memory no longer commits; keep reindex incremental
         if i % 50 == 0 or i == len(rows):
             print(f"  {i}/{len(rows)}")
@@ -2282,8 +2400,10 @@ def cmd_doctor(args) -> int:
             ok = 0
             for mid in missing:
                 r = cursor.execute(
-                    "SELECT title, content FROM memories WHERE id = ?", (mid,)).fetchone()
-                if r and embed_memory(conn, mid, r["title"] or "", r["content"] or ""):
+                    f"SELECT title, content, {_anchor_col(conn).replace('m.', '')} "
+                    "FROM memories WHERE id = ?", (mid,)).fetchone()
+                if r and embed_memory(conn, mid, r["title"] or "", r["content"] or "",
+                                      _row_get(r, "anchor")):
                     conn.commit()
                     ok += 1
                 else:
@@ -2410,6 +2530,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-blocks", action="store_true", help="omit pinned core blocks")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context)
+
+    # anchor backfill
+    s = sub.add_parser("anchor", help="Backfill the `anchor` entity on memories that lack one")
+    s.add_argument("--limit", type=int, help="only the N most recent unanchored")
+    s.add_argument("--model", default="sonnet")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--no-embed", action="store_true", help="skip re-embedding (FTS still updates)")
+    s.set_defaults(func=cmd_anchor)
 
     # feedback
     s = sub.add_parser("feedback",
