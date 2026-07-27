@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps (FTS-only — no ML stack)
-        run: pip install sqlite-vec pytest ruff
+        run: pip install sqlite-vec pytest "ruff==0.16.0"   # pinned: unpinned ruff drifts its default rule set
 
       - name: Lint
         run: ruff check .

@@ -34,9 +34,16 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# Defaults (E4/E7/E9 + F) are the right altitude for a single-file CLI:
-# real bugs (unused names, stray f-strings), no style churn. E501 stays off —
-# a handful of long SQL/print lines read better unwrapped.
+# E4/E7/E9 + F is the right altitude for a single-file CLI: real bugs (unused
+# names, stray f-strings), no style churn. E501 stays off — a handful of long
+# SQL/print lines read better unwrapped.
+#
+# SELECTED EXPLICITLY, not inherited. This used to rely on ruff's defaults,
+# which drift between releases: CI installs ruff unpinned, so 0.16.0 silently
+# widened the default set (PLW1510/I001/EXE001/BLE001/UP017/FURB167/RUF007/C408)
+# and failed the build on 27 pre-existing style nits in untouched files.
+# Pinning the rule set here means any ruff version lints identically.
+select = ["E4", "E7", "E9", "F"]
 ignore = []
 
 [tool.pytest.ini_options]
