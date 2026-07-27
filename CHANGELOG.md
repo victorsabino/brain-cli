@@ -5,6 +5,76 @@ All notable changes to brain-cli are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-27
+
+Schema v5. Closes the last open item on the June competitor-analysis roadmap
+(pinned core blocks) and adds the three ideas worth taking from cognee's
+memory layer — usefulness feedback, declared identity, entity anchoring —
+without taking its knowledge graph or its LLM-call-per-chunk ingest.
+
+### Added
+- `brain review` — triage for the harvest review queue, which until now was
+  write-only: ambiguous candidates accumulated (1098 by 2026-07-27) with no
+  way to drain them, quietly making reconcile-gated capture lossy.
+  `--auto` re-decides each queued candidate against the CURRENT db and
+  resolves only the unambiguous ends (drops near-dups/echoes, saves clearly
+  new facts), leaving genuinely ambiguous ones for a human. `--dry-run`,
+  `--resolve N --action drop|save|update --uid`, `--clear --yes`, `--file`.
+- `brain review --auto --judge` — a second, **orthogonal** gate. `reconcile`
+  only ever measured DUPLICATION; an audit of 40 of the 780 auto-savable
+  candidates found **27% transient junk** (point-in-time status, phase
+  tracking, lead counts) that duplication cannot see — and best-neighbor
+  similarity did NOT separate it (mean 0.546 junk vs 0.569 usable), so no
+  threshold tuning could substitute. `--judge` adds one batched LLM pass
+  (40 candidates/call) applying the same REJECT standard as `HARVEST_PROMPT`,
+  retroactively. Junk is dropped from the ambiguous bucket too; ambiguous
+  survivors stay queued, because what makes them ambiguous is duplication,
+  which this pass never examined. **Fails safe**: a failed, non-zero-exit,
+  or unparseable batch drops nothing, and out-of-range indices returned by
+  the model are ignored — a hiccup can never silently delete facts.
+
+  Measured on the real 1102-entry backlog (2026-07-27): dropped 270 (264 of
+  them junk the judge caught), saved 621, left 211 genuinely ambiguous for a
+  human. A blind 40-item re-audit of what landed put the junk rate at **10%,
+  down from 27%** without the judge. Not zero — mostly time-sensitive
+  prioritization notes that read as durable decisions.
+- `brain feedback <uid> up|down [--note]` — explicit usefulness signal.
+  `recall_log` records that a memory was *shown*; this records whether it
+  *helped*. Feeds a signed, log-damped, **±0.08-capped** term in ranking:
+  enough to reorder near-ties, never enough to float an irrelevant memory
+  above a real lexical/semantic hit. A downvoted memory is demoted, not
+  hidden (`invalidate` remains the tool for "this is wrong").
+  Surfaced in `search --explain` only when feedback exists.
+- `brain block set|list|rm` — pinned core blocks (roadmap item 8): a few
+  short labelled values injected into every `brain context` regardless of
+  query. Per-block `--char-limit`, and pins are drawn from the SAME token
+  budget and hard-capped at half of it, so the feature that exists to
+  prevent unbounded injection cannot become it.
+- `--identity` on `save`/`reconcile` — declared merge key. An exact,
+  namespaced, normalized key (`<type>:<sha256(value)[:16]>`); when a live
+  memory already holds it, reconcile returns `update` **by declaration**,
+  overriding similarity. Borrowed from cognee's `DataPoint`/`identity_fields`:
+  a fact with no stable identity can never merge across runs. Partial-unique
+  index enforces one live holder; invalidated predecessors keep theirs.
+- `--anchor` on `save`/`reconcile` + anchor extraction in the harvest prompt —
+  the single entity a fact is about. `brain context` groups by anchor
+  (`### corena`), so recalled memory reads as knowledge about a thing rather
+  than a flat list of trivia. Falls back to the flat list when unanchored.
+- Schema v5: `identity_key`, `anchor` columns; `memory_feedback`, `blocks`
+  tables. All v5 features degrade gracefully on pre-v5 DBs until
+  `brain migrate`.
+- 27 tests (`tests/test_v5.py`), fts-only.
+
+### Changed
+- `search --explain` gains `feedback_net` / `feedback_bonus`.
+- `brain stats` reports `brain v5`.
+
+### Notes
+- `brain context --json` deliberately **stays a flat list**. Pinned blocks ride
+  along as entries flagged `"pinned": true`, so existing consumers that ignore
+  the flag see exactly what they saw before. Turning it into an object would
+  have broken every agent parsing it, silently.
+
 ## [3.4.0] - 2026-06-11
 
 ### Added

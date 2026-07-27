@@ -17,12 +17,16 @@ HERE = Path(__file__).resolve().parent
 # a newer brain — running an old migrator against it could silently downgrade.
 # v4 (2026-06): invalid_at (soft fact invalidation), abstract (L0 tier for
 # token-budgeted context injection), recall_log (re-extraction guard).
-SCHEMA_VERSION = 4
+# v5 (2026-07): identity_key (declared merge key — exact, not similarity),
+# anchor (the entity a lesson is about), memory_feedback (usefulness signal
+# feeding ranking), blocks (pinned always-injected context).
+SCHEMA_VERSION = 5
 
 # Tables created by SCHEMA_SQL / setup_vec_extension — used for dry-run planning.
 SCHEMA_TABLES = [
     "tags", "memory_tags", "type_aliases", "task_meta",
     "memory_links", "memory_versions", "alterations", "recall_log",
+    "memory_feedback", "blocks",
 ]
 VEC_TABLES = ["memory_vectors", "memory_chunks"]
 
@@ -40,6 +44,14 @@ NEW_COLUMNS = [
     ("invalid_at", "DATETIME"),
     # v4: L0 tier — ~1-2 sentence abstract for token-budgeted `brain context`.
     ("abstract", "TEXT"),
+    # v5: declared identity — "<type>:<sha256(normalized value)[:16]>". When
+    # set, reconcile treats a match as the SAME fact by declaration and merges
+    # instead of adding, regardless of embedding similarity.
+    ("identity_key", "TEXT"),
+    # v5: the entity a lesson is about (client, repo, person, system). Lets
+    # `brain context` group entity-anchored lessons instead of emitting a flat
+    # list of unrelated facts.
+    ("anchor", "TEXT"),
 ]
 
 # Everything below is pure CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS — safe to re-run.
@@ -146,6 +158,35 @@ CREATE TABLE IF NOT EXISTS recall_log (
 );
 CREATE INDEX IF NOT EXISTS idx_recall_log_time ON recall_log(recalled_at);
 CREATE INDEX IF NOT EXISTS idx_recall_log_memory ON recall_log(memory_id);
+
+-- v5: declared identity. Partial-unique so at most one LIVE memory can hold a
+-- given identity; invalidated/deleted predecessors keep theirs for history.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_identity
+  ON memories(identity_key)
+  WHERE identity_key IS NOT NULL AND deleted_at IS NULL AND invalid_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_anchor ON memories(anchor) WHERE anchor IS NOT NULL;
+
+-- v5: usefulness signal. recall_log records that a memory was SHOWN; this
+-- records whether it actually helped. Feeds a small capped term in ranking.
+CREATE TABLE IF NOT EXISTS memory_feedback (
+  id        INTEGER PRIMARY KEY,
+  memory_id INTEGER NOT NULL,
+  signal    INTEGER NOT NULL,
+  note      TEXT,
+  ts        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id);
+
+-- v5: pinned core blocks — a few short labelled values injected into EVERY
+-- `brain context` regardless of the query. char_limit is enforced so this can
+-- never become the unbounded-injection problem it exists to prevent.
+CREATE TABLE IF NOT EXISTS blocks (
+  label      TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  char_limit INTEGER NOT NULL DEFAULT 400,
+  position   INTEGER NOT NULL DEFAULT 100,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 TYPE_ALIASES = [

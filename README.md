@@ -36,10 +36,13 @@ brain reconcile --title "..." --content "..."  # ADD/UPDATE/NOOP packet before s
 brain invalidate <uid> --superseded-by <uid>   # fact no longer true (soft, reversible)
 brain consolidate                              # near-duplicate clusters; --merge to fold
 brain harvest <transcript.jsonl>               # auto-extract memories from agent sessions
+brain review --auto --judge --dry-run          # triage the harvest queue (drop --dry-run to apply)
+brain feedback <uid> up|down                   # was it useful? feeds ranking
+brain block set persona "Terse. No preamble."  # pinned context, injected every time
 brain link  <src_uid> <dst_uid> <kind>
 brain stats · brain recent 20
 brain reindex     # backfill embeddings
-brain migrate     # apply schema (v4)
+brain migrate     # apply schema (v5)
 ```
 
 ## What it fixes
@@ -202,12 +205,53 @@ top complaint class). v4 adds one mechanism against each:
   otherwise the content head is used. Included memories land in
   `recall_log`, which is what powers the re-extraction guard.
 
+v5 adds four more, three of them borrowed from cognee's memory layer (the
+graph and the LLM-call-per-chunk ingest were deliberately not borrowed —
+6k authored one-fact memories don't need entity extraction to find edges
+that are already in the title and tags):
+
+- **`brain review`** — drains the harvest review queue. `harvest` parks
+  ambiguous candidates in `harvest-review.jsonl`; nothing read that file, so
+  it grew to 1098 entries and the "hygiene-approved facts get stored" promise
+  above was quietly only half true. `--auto` re-decides each candidate
+  against the *current* db (most were queued weeks ago and the neighbourhood
+  has moved) and resolves only the unambiguous ends, leaving real judgement
+  calls for a human. Always `--dry-run` first.
+
+  Use `--judge` with it. `reconcile` measures **duplication**; the queue's
+  other problem is **durability**, and the two are orthogonal — an audit of
+  40 auto-savable candidates found 27% transient junk (status lines, phase
+  tracking, decaying counts) that similarity could not distinguish from the
+  good ones (mean best-sim 0.546 vs 0.569). `--judge` adds one batched LLM
+  pass applying the harvest REJECT standard retroactively. It fails safe: a
+  broken batch drops nothing.
+- **`brain feedback <uid> up|down`** — cognee reweights graph edges from
+  answer feedback; this is the flat-store equivalent. `recall_log` knows a
+  memory was *shown*, which is not the same as useful. The ranking term is
+  signed, log-damped and capped at ±0.08 — it reorders near-ties and nothing
+  else, because a usefulness signal that can outvote relevance is a
+  popularity contest.
+- **`--identity`** — a declared merge key, exact and namespaced, not a
+  similarity guess. cognee's `DataPoint` makes the same point: a node with a
+  random id can never merge across runs. When a live memory holds the
+  identity, reconcile says `update` *by declaration* and similarity doesn't
+  get a vote. (Matching on a shared token instead of an exact key is how you
+  get `health` → sutter**health**.)
+- **`--anchor`** + anchor grouping in `context` — the one entity a fact is
+  about. Harvest now asks for it. `context` groups by anchor, so injected
+  memory reads as knowledge about a thing instead of a flat list of trivia.
+
 ## Backwards compat
 
 Old commands `brain query` and `brain add` still work as aliases for `search`
 and `save`. Pre-migration DBs (no `memory_chunks`) fall back to the legacy
-single-vector `memory_vectors` table; v4 features degrade gracefully on
-pre-v4 schemas (filters skip, `--abstract` warns) until `brain migrate` runs.
+single-vector `memory_vectors` table; v4/v5 features degrade gracefully on
+older schemas (filters skip, `--abstract`/`--identity`/`--anchor` warn,
+feedback and pinned blocks no-op) until `brain migrate` runs.
+
+`brain context --json` is a flat list and stays one — pinned blocks appear as
+entries flagged `"pinned": true`, so a consumer that ignores the flag sees
+exactly what it saw in v4.
 
 ## Development
 
