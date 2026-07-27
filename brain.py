@@ -1835,6 +1835,187 @@ def cmd_anchor(args) -> int:
     return 0
 
 
+# Secret patterns → env-var prefix. Deliberately narrow: high-confidence,
+# structurally distinctive tokens only. A loose pattern here would rewrite
+# innocent content, and the whole operation is a content mutation.
+# Two failure modes to avoid, both hit on the first live run (2026-07-27):
+#
+# TOO NARROW — `secret_[A-Za-z0-9]{20,}` stopped at the first '-' or '_', so a
+# real token like `secret_plB3nYUn-_oK7…` was matched only in part or not at
+# all, and the follow-up scan then reported "no secrets" with false
+# confidence. Credential alphabets include - _ + / = ; the body classes below
+# all do too.
+#
+# TOO BROAD — `A[A-Za-z0-9_\-]{40,}` matches ANY 41-char token beginning with
+# "A", including opaque resource IDs sitting in URLs. An unanchored high-
+# entropy pattern will eat real content. Anything that is not
+# self-identifying by prefix now REQUIRES a context cue (`Bearer `).
+SECRET_PATTERNS: list[tuple[str, str, str]] = [
+    ("aws_access_key_id", r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY_ID"),
+    ("github_pat", r"gh[pousr]_[A-Za-z0-9_\-]{20,}", "GITHUB_TOKEN"),
+    ("openai_key", r"sk-[A-Za-z0-9_\-]{32,}", "OPENAI_API_KEY"),
+    ("slack_token", r"xox[baprs]-[A-Za-z0-9-]{10,}", "SLACK_TOKEN"),
+    ("scout_key", r"sk_[A-Za-z0-9+/=_\-]{20,}", "SCOUT_API_KEY"),
+    ("scout_secret", r"secret_[A-Za-z0-9+/=_\-]{20,}", "SCOUT_ORG_SECRET"),
+    # context-anchored: only a token presented AS a bearer credential
+    ("bearer_token", r"(?<=Bearer )[A-Za-z0-9+/=_\-]{30,}", "BEARER_TOKEN"),
+]
+
+# Obvious non-secrets that structurally match. A placeholder rewritten into a
+# ${VAR} would destroy the instruction the memory exists to convey.
+SECRET_PLACEHOLDER = re.compile(
+    r"^(\$|<|\{)|[<>]|^(YOUR|REDACTED|EXAMPLE|xxx+|\.\.\.)", re.I)
+
+SECRETS_ENV_DEFAULT = Path.home() / ".config/brain/secrets.env"
+
+
+def _scan_secrets(conn: sqlite3.Connection) -> list[dict]:
+    """Every secret-looking token in live memory content.
+
+    Returns records with the VALUE included — callers must never print it.
+    """
+    out = []
+    for r in conn.execute(
+        "SELECT id, uid, title, content FROM memories "
+        "WHERE deleted_at IS NULL AND invalid_at IS NULL AND content IS NOT NULL"
+    ):
+        content = r["content"] or ""
+        for kind, pat, prefix in SECRET_PATTERNS:
+            for m in re.finditer(pat, content):
+                val = m.group(0)
+                # already replaced by a previous run, or a placeholder the
+                # memory is deliberately telling you to substitute
+                if val.startswith("${") or SECRET_PLACEHOLDER.search(val):
+                    continue
+                # never rewrite something already inside a ${...} reference
+                if content[max(0, m.start() - 2):m.start()] == "${":
+                    continue
+                out.append({"id": r["id"], "uid": r["uid"], "title": r["title"],
+                            "kind": kind, "prefix": prefix, "value": val})
+    return out
+
+
+def _env_load(path: Path) -> dict[str, str]:
+    """Existing VAR=value pairs, so re-runs reuse names instead of duplicating."""
+    got: dict[str, str] = {}
+    if not path.exists():
+        return got
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        got[k.strip()] = v.strip().strip("'\"")
+    return got
+
+
+def cmd_secrets(args) -> int:
+    """Move secret values out of memory content into a chmod-600 env file,
+    leaving a ${VAR} reference behind.
+
+    Memories get injected into agent context by `search`/`context`, so a live
+    credential stored in one can end up echoed into a transcript. Deleting the
+    memory would lose the runbook it lives in; this keeps the note useful and
+    moves only the value.
+
+    Never prints a secret value — only counts, kinds and var names.
+    """
+    conn = connect(load_vec=True)
+    env_path = Path(args.env_file) if args.env_file else SECRETS_ENV_DEFAULT
+    if not args.extract:
+        args.scan = True
+    found = _scan_secrets(conn)
+    if not found:
+        print("no secret-looking values in live memory content")
+        return 0
+
+    existing = _env_load(env_path)
+    val_to_var = {v: k for k, v in existing.items()}
+    counters: dict[str, int] = {}
+    for var in existing:
+        base = var.rsplit("_", 1)[0]
+        try:
+            counters[base] = max(counters.get(base, 0), int(var.rsplit("_", 1)[1]))
+        except (ValueError, IndexError):
+            pass
+
+    by_kind: dict[str, int] = {}
+    for f in found:
+        by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
+    uniq = {f["value"] for f in found}
+    print(f"{len(found)} occurrence(s) of {len(uniq)} distinct value(s) "
+          f"across {len({f['uid'] for f in found})} memories")
+    for k, n in sorted(by_kind.items()):
+        print(f"  {k:20} {n}")
+
+    if args.scan:
+        print(f"\nvalues NOT shown. move them out with: brain secrets --extract "
+              f"(env file: {env_path})")
+        return 0
+
+    # assign a var per DISTINCT value so the same credential is one variable
+    assigned: dict[str, str] = {}
+    for f in found:
+        if f["value"] in val_to_var:
+            assigned[f["value"]] = val_to_var[f["value"]]
+            continue
+        if f["value"] in assigned:
+            continue
+        counters[f["prefix"]] = counters.get(f["prefix"], 0) + 1
+        assigned[f["value"]] = f"{f['prefix']}_{counters[f['prefix']]}"
+
+    if args.dry_run:
+        print(f"\nDRY RUN — would write {len(set(assigned.values()) - set(existing))} "
+              f"new var(s) to {env_path} and rewrite {len(found)} occurrence(s):")
+        for f in found:
+            print(f"  {f['uid']}  {f['kind']:18} → ${{{assigned[f['value']]}}}  "
+                  f"({f['title'][:44]})")
+        return 0
+
+    # 1. env file first — never rewrite content before the value is saved
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    new_lines = []
+    for val, var in assigned.items():
+        if var not in existing:
+            new_lines.append(f"{var}='{val}'")
+    if new_lines:
+        header = "" if env_path.exists() else (
+            "# Secrets extracted from brain.db by `brain secrets --extract`.\n"
+            "# Memories reference these as ${VAR}. chmod 600 — never commit.\n")
+        with open(env_path, "a") as f:
+            if header:
+                f.write(header)
+            f.write("\n".join(new_lines) + "\n")
+    os.chmod(env_path, 0o600)
+
+    # 2. rewrite content, refresh hash + embedding, log the alteration
+    touched = 0
+    for f in found:
+        row = conn.execute("SELECT title, content, anchor FROM memories WHERE id = ?",
+                           (f["id"],)).fetchone() if _schema_flags(conn).get("anchor") else \
+            conn.execute("SELECT title, content, NULL AS anchor FROM memories WHERE id = ?",
+                         (f["id"],)).fetchone()
+        if not row or f["value"] not in (row["content"] or ""):
+            continue          # already replaced by an earlier occurrence
+        new_content = (row["content"] or "").replace(
+            f["value"], "${" + assigned[f["value"]] + "}")
+        if f"see {env_path}" not in new_content:
+            new_content += f"\n\n[secret values moved to {env_path} — reference by ${{VAR}}]"
+        conn.execute("UPDATE memories SET content = ?, content_hash = ? WHERE id = ?",
+                     (new_content, content_hash(row["title"] or "", new_content), f["id"]))
+        log_alteration(conn, f["uid"], "redact",
+                       delta=f"{f['kind']} → ${{{assigned[f['value']]}}}",
+                       reason="secret moved to env file")
+        if not args.no_embed and _vec_loaded:
+            embed_memory(conn, f["id"], row["title"] or "", new_content, _row_get(row, "anchor"))
+        touched += 1
+    conn.commit()
+    print(f"\nmoved {len(set(assigned.values()))} distinct value(s) → {env_path} (chmod 600)")
+    print(f"rewrote {touched} memory occurrence(s) to ${{VAR}} references")
+    print("load them with:  set -a && . " + str(env_path) + " && set +a")
+    return 0
+
+
 def ensure_harvest_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS harvest_state (
@@ -2530,6 +2711,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-blocks", action="store_true", help="omit pinned core blocks")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context)
+
+    # secrets
+    s = sub.add_parser("secrets",
+                       help="Move secret values out of memory content into a chmod-600 env file")
+    s.add_argument("--scan", action="store_true", help="report only (default if no --extract)")
+    s.add_argument("--extract", action="store_true", help="rewrite content to ${VAR} references")
+    s.add_argument("--dry-run", action="store_true", help="with --extract: show the plan")
+    s.add_argument("--env-file", help=f"default {SECRETS_ENV_DEFAULT}")
+    s.add_argument("--no-embed", action="store_true")
+    s.set_defaults(func=cmd_secrets)
 
     # anchor backfill
     s = sub.add_parser("anchor", help="Backfill the `anchor` entity on memories that lack one")
