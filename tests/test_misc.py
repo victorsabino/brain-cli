@@ -10,7 +10,7 @@ def test_stats_reports_schema_and_counts(fixture_db):
     db, _ = fixture_db
     r = run_brain(db, "stats")
     assert r.returncode == 0, r.stderr
-    assert "brain v6" in r.stdout
+    assert "brain v7" in r.stdout
     assert "active:" in r.stdout
     assert "by type:" in r.stdout
 

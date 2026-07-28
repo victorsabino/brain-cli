@@ -20,13 +20,13 @@ HERE = Path(__file__).resolve().parent
 # v5 (2026-07): identity_key (declared merge key — exact, not similarity),
 # anchor (the entity a lesson is about), memory_feedback (usefulness signal
 # feeding ranking), blocks (pinned always-injected context).
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Tables created by SCHEMA_SQL / setup_vec_extension — used for dry-run planning.
 SCHEMA_TABLES = [
     "tags", "memory_tags", "type_aliases", "task_meta",
     "memory_links", "memory_versions", "alterations", "recall_log",
-    "memory_feedback", "blocks",
+    "memory_feedback", "blocks", "artifacts", "memory_artifacts",
 ]
 VEC_TABLES = ["memory_vectors", "memory_chunks"]
 
@@ -165,6 +165,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_identity
   ON memories(identity_key)
   WHERE identity_key IS NOT NULL AND deleted_at IS NULL AND invalid_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_memories_anchor ON memories(anchor) WHERE anchor IS NOT NULL;
+
+-- v7: artifact graph. A memory cannot hold a 126MB db dump, so it holds a
+-- POINTER plus the file's state at the moment the fact was recorded. `brain
+-- artifact check` re-stats them, so a memory can tell you not just where the
+-- file is but whether it still says what it said. 41% of the filesystem paths
+-- referenced by the corpus on 2026-07-27 no longer existed — dangling
+-- pointers that nothing was tracking.
+CREATE TABLE IF NOT EXISTS artifacts (
+  id           INTEGER PRIMARY KEY,
+  path         TEXT NOT NULL UNIQUE,   -- as written (may contain ~)
+  real_path    TEXT NOT NULL,          -- expanduser'd, for stat()
+  kind         TEXT,                   -- file | dir
+  size         INTEGER,
+  sha256       TEXT,                   -- NULL when over the hash cap
+  mtime        TEXT,
+  first_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+  last_checked TEXT,
+  missing_at   TEXT,                   -- soft, mirrors invalid_at
+  changed_at   TEXT                    -- last time size/hash moved
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_missing ON artifacts(missing_at);
+
+CREATE TABLE IF NOT EXISTS memory_artifacts (
+  memory_id   INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+  PRIMARY KEY (memory_id, artifact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memart_artifact ON memory_artifacts(artifact_id);
 
 -- v5: usefulness signal. recall_log records that a memory was SHOWN; this
 -- records whether it actually helped. Feeds a small capped term in ranking.
