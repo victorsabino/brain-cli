@@ -364,21 +364,21 @@ def test_auto_without_judge_does_not_call_llm(db, tmp_path):
 
 # ── v6: anchor is actually INDEXED (v5 stored it but indexed it nowhere) ────
 
-def test_fts_indexes_anchor(db):
+def test_fts_does_not_index_anchor(db):
+    """v8 reverses v6 on measured evidence.
+
+    Indexing `anchor` was supposed to disambiguate dense clusters. Over 150
+    real queries it did the opposite: recall@5 0.83 -> 0.82, vague-phrasing
+    0.62 -> 0.60, 9 paired queries better and 16 worse. The anchor vocabulary
+    collapsed onto project names (1390 memories anchored "citibot"), so it
+    duplicated the already-indexed `project` column and fed a low-IDF token
+    into BM25. The column stays for grouping; the index entry does not.
+    """
     conn = sqlite3.connect(db)
     ddl = conn.execute(
         "SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()[0]
     conn.close()
-    assert "anchor" in ddl, "anchor must be an FTS column or it can never be retrieved"
-
-
-def test_anchor_is_searchable(db):
-    """The whole point of v6: find a memory by its anchor alone."""
-    _save(db, "shortened the page title", "changed the h1 text", anchor="corena")
-    r = run_brain(db, "search", "corena", "--json", "--no-semantic")
-    hits = json.loads(r.stdout)
-    assert any("shortened the page title" in h["title"] for h in hits), \
-        "anchor token must retrieve the memory even though it is not in title/content"
+    assert "anchor" not in ddl
 
 
 def test_anchor_reaches_embedded_chunk_text(brain_mod):
@@ -386,17 +386,6 @@ def test_anchor_reaches_embedded_chunk_text(brain_mod):
     assert all("corena" in t for t in texts)
     plain = brain_mod.chunk_texts("some title", "some body")
     assert all("corena" not in t for t in plain)
-
-
-def test_anchor_update_refreshes_fts(db):
-    """Anchor set after insert must reach FTS via the trigger, not just the row."""
-    _save(db, "zzz obscure title", "zzz obscure body")
-    conn = sqlite3.connect(db)
-    conn.execute("UPDATE memories SET anchor='falkor' WHERE title='zzz obscure title'")
-    conn.commit()
-    conn.close()
-    r = run_brain(db, "search", "falkor", "--json", "--no-semantic")
-    assert any("zzz obscure" in h["title"] for h in json.loads(r.stdout))
 
 
 def test_anchor_backfill_sets_and_skips(db, tmp_path):
@@ -636,3 +625,158 @@ def test_artifact_list_and_dry_run(db, tmp_path):
     conn.close()
     run_brain(db, "artifact", "scan")
     assert "listed.txt" in run_brain(db, "artifact", "list").stdout
+
+
+# ── v8: LLM re-rank of the top-20 window ────────────────────────────────────
+
+def _three(db):
+    a = _save(db, "alpha topic note", "alpha alpha alpha shared token")
+    b = _save(db, "beta topic note", "beta beta shared token")
+    c = _save(db, "gamma topic note", "gamma shared token")
+    return a, b, c
+
+
+def test_rerank_reorders_by_model_verdict(db, tmp_path):
+    a, b, c = _three(db)
+    order = json.dumps([3, 1, 2])          # put the 3rd candidate first
+    base = run_brain(db, "search", "shared token", "--json", "--no-semantic")
+    base_uids = [h["uid"] for h in json.loads(base.stdout)]
+    r = run_brain(db, "search", "shared token", "--json", "--no-semantic", "--rerank",
+                  env_extra=_stub_claude(tmp_path, order))
+    got = [h["uid"] for h in json.loads(r.stdout)]
+    assert got[0] == base_uids[2], "model's first pick must lead"
+    assert sorted(got) == sorted(base_uids), "reranking must not add or drop results"
+
+
+def test_rerank_fails_safe_on_bad_output(db, tmp_path):
+    _three(db)
+    base = [h["uid"] for h in json.loads(
+        run_brain(db, "search", "shared token", "--json", "--no-semantic").stdout)]
+    for payload, code in [("not json", 0), ("[]", 1), ("[1,2,3]", 1)]:
+        r = run_brain(db, "search", "shared token", "--json", "--no-semantic", "--rerank",
+                      env_extra=_stub_claude(tmp_path, payload, exit_code=code))
+        assert [h["uid"] for h in json.loads(r.stdout)] == base
+
+
+def test_rerank_incomplete_permutation_keeps_every_result(db, tmp_path):
+    """A model that names only some candidates must not silently drop the rest."""
+    _three(db)
+    base = [h["uid"] for h in json.loads(
+        run_brain(db, "search", "shared token", "--json", "--no-semantic").stdout)]
+    r = run_brain(db, "search", "shared token", "--json", "--no-semantic", "--rerank",
+                  env_extra=_stub_claude(tmp_path, json.dumps([2])))
+    got = [h["uid"] for h in json.loads(r.stdout)]
+    assert sorted(got) == sorted(base)
+    assert got[0] == base[1]
+
+
+def test_rerank_ignores_out_of_range_indices(db, tmp_path):
+    _three(db)
+    base = [h["uid"] for h in json.loads(
+        run_brain(db, "search", "shared token", "--json", "--no-semantic").stdout)]
+    r = run_brain(db, "search", "shared token", "--json", "--no-semantic", "--rerank",
+                  env_extra=_stub_claude(tmp_path, json.dumps([99, 0, -4, 2])))
+    got = [h["uid"] for h in json.loads(r.stdout)]
+    assert sorted(got) == sorted(base) and got[0] == base[1]
+
+
+def test_no_rerank_flag_means_no_model_call(db, tmp_path):
+    _three(db)
+    r = run_brain(db, "search", "shared token", "--json", "--no-semantic",
+                  env_extra=_stub_claude(tmp_path, "boom", exit_code=1))
+    assert len(json.loads(r.stdout)) == 3
+
+
+def test_rerank_respects_limit(db, tmp_path):
+    _three(db)
+    r = run_brain(db, "search", "shared token", "--json", "--no-semantic", "--rerank",
+                  "--limit", "2", env_extra=_stub_claude(tmp_path, json.dumps([3, 1, 2])))
+    assert len(json.loads(r.stdout)) == 2
+
+
+# ── reachability eval harness ───────────────────────────────────────────────
+
+def test_reachability_eval_runs_and_gates(fixture_db):
+    """The harness itself must work, and its threshold must actually fail."""
+    import subprocess
+    import sys
+    from conftest import ROOT
+    db, _golden = fixture_db
+    script = ROOT / "scripts" / "eval_reachability.py"
+    probes = ROOT / "tests" / "fixtures" / "probes_synthetic.jsonl"
+    ok = subprocess.run([sys.executable, str(script), "--db", str(db), "--probes", str(probes),
+                         "--no-semantic", "--min-recall5", "0.95"],
+                        capture_output=True, text=True, timeout=300)
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    assert "weakest entry point" in ok.stdout
+    # an impossible threshold must fail, or the gate is decorative
+    bad = subprocess.run([sys.executable, str(script), "--db", str(db), "--probes", str(probes),
+                          "--no-semantic", "--min-recall5", "1.01"],
+                         capture_output=True, text=True, timeout=300)
+    assert bad.returncode == 1 and "FAIL" in bad.stderr
+
+
+def test_reachability_probes_have_three_distinct_entry_points():
+    """A vague probe that reuses the title's proper nouns measures nothing."""
+    from conftest import ROOT
+    path = ROOT / "tests" / "fixtures" / "probes_synthetic.jsonl"
+    n = 0
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = json.loads(line)
+        n += 1
+        assert set(p["queries"]) == {"natural", "keyword", "vague"}
+        qs = list(p["queries"].values())
+        assert len(set(qs)) == 3, f"{p['title']}: entry points must differ"
+        # the vague probe must not simply restate the title
+        title_words = {w.lower().strip(".,—") for w in p["title"].split() if len(w) > 4}
+        vague_words = {w.lower().strip(".,—") for w in p["queries"]["vague"].split()}
+        overlap = title_words & vague_words
+        assert len(overlap) <= 2, f"{p['title']}: vague probe reuses {overlap}"
+    assert n >= 15
+
+
+# ── implicit feedback (v8): the signal nobody has to remember to send ───────
+
+def test_implicit_feedback_on_get_after_recall(db):
+    uid = _save(db, "implicit signal memory", "surfaced then opened")
+    run_brain(db, "context", "implicit signal", "--no-semantic")   # surfaces it
+    run_brain(db, "get", uid)                                      # opening = useful
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM memory_feedback WHERE note='implicit'").fetchone()[0]
+    conn.close()
+    assert n == 1
+
+
+def test_no_implicit_feedback_without_a_prior_recall(db):
+    """A direct `get` is not evidence brain surfaced anything useful."""
+    uid = _save(db, "cold get memory", "never surfaced first")
+    run_brain(db, "get", uid)
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0]
+    conn.close()
+    assert n == 0
+
+
+def test_implicit_feedback_capped_once_per_day(db):
+    """A loop opening the same memory must not be able to inflate its rank."""
+    uid = _save(db, "loopy memory", "surfaced then opened many times")
+    run_brain(db, "context", "loopy", "--no-semantic")
+    for _ in range(5):
+        run_brain(db, "get", uid)
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM memory_feedback WHERE note='implicit'").fetchone()[0]
+    conn.close()
+    assert n == 1
+
+
+def test_implicit_feedback_can_be_disabled(db):
+    uid = _save(db, "opted out memory", "surfaced then opened")
+    run_brain(db, "context", "opted out", "--no-semantic")
+    run_brain(db, "get", uid, env_extra={"BRAIN_NO_IMPLICIT_FEEDBACK": "1"})
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0]
+    conn.close()
+    assert n == 0

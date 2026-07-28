@@ -32,3 +32,9 @@ jobs:
           python tests/fixtures/make_fixture.py /tmp/fixture.db --golden-out /tmp/golden_synthetic.jsonl
           python scripts/eval.py --golden /tmp/golden_synthetic.jsonl \
             --db /tmp/fixture.db --no-semantic --min-recall5 0.9
+
+      - name: Reachability gate (multi-phrasing, keyword/natural/vague)
+        run: |
+          python scripts/eval_reachability.py --db /tmp/fixture.db \
+            --probes tests/fixtures/probes_synthetic.jsonl \
+            --no-semantic --min-recall5 0.95 --min-recall5-vague 0.90
