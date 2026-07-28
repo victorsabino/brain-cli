@@ -773,6 +773,86 @@ def _hybrid_search(conn, cursor, query: str, limit: int, filter_sql: str,
     return scored[:limit], explain
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Re-ranking (v8)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Measured on 150 real queries (2026-07-27): for vague, half-remembered
+# phrasings the correct memory was in the top-20 90% of the time but in the
+# top-5 only 60% of the time. Retrieval was never the bottleneck — ORDER was.
+# So the fix is a second pass over a small candidate window, not a better
+# first-stage retriever (anchors were tried as a retrieval fix and measured
+# NEGATIVE: 0.83 -> 0.82 overall, 0.62 -> 0.60 vague).
+#
+# Ceiling for this technique on that data is recall@5 -> ~0.90.
+RERANK_WINDOW = int(os.environ.get("BRAIN_RERANK_WINDOW", "20"))
+
+RERANK_PROMPT = """Rank these candidate memories by how well each ANSWERS the query.
+
+The query is how someone half-remembers a fact months later, so it may not
+share any words with the right memory. Judge by MEANING, not word overlap.
+A memory that is merely on the same topic is NOT a match; prefer the one that
+contains the specific fact being asked for.
+
+QUERY: {query}
+
+CANDIDATES:
+{candidates}
+
+Output ONLY a JSON array of candidate numbers, best first, no prose and no
+code fences. Include every number exactly once: [3, 1, 7, ...]"""
+
+
+def _rerank(query: str, scored: list, model: str, keep: int) -> list:
+    """LLM re-rank of the top candidates. Returns a reordered `scored` list.
+
+    Fails SAFE: any error, timeout, unparseable output or incomplete
+    permutation returns the original order untouched. A re-ranker that
+    silently drops results is worse than no re-ranker.
+    """
+    import subprocess
+    import tempfile
+
+    window = scored[:keep]
+    if len(window) < 2:
+        return scored
+    lines = []
+    for n, (_s, r) in enumerate(window, 1):
+        abstract = _row_get(r, "abstract") or _auto_abstract(r["content"], 160)
+        lines.append(f"{n}. [{r['type']}] {r['title']} — {abstract}")
+    prompt = RERANK_PROMPT.format(query=query, candidates="\n".join(lines))
+    try:
+        res = subprocess.run(["claude", "-p", prompt, "--model", model],
+                             capture_output=True, text=True, timeout=90,
+                             cwd=tempfile.gettempdir(),
+                             env={**os.environ, "BRAIN_HARVEST": "1"})
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _warn(f"rerank skipped ({e})")
+        return scored
+    if res.returncode != 0:
+        _warn(f"rerank skipped (claude exit {res.returncode})")
+        return scored
+    m = re.search(r"\[.*\]", res.stdout, re.S)
+    if not m:
+        _warn("rerank skipped (no JSON)")
+        return scored
+    try:
+        order = [int(x) for x in json.loads(m.group(0)) if isinstance(x, int)]
+    except (ValueError, TypeError):
+        _warn("rerank skipped (bad JSON)")
+        return scored
+    seen, clean = set(), []
+    for n in order:
+        if 1 <= n <= len(window) and n not in seen:
+            seen.add(n)
+            clean.append(n)
+    if len(clean) != len(window):
+        # incomplete permutation → append whatever the model omitted, in place,
+        # rather than losing results
+        clean += [n for n in range(1, len(window) + 1) if n not in seen]
+    return [window[n - 1] for n in clean] + scored[keep:]
+
+
 def _explain_line(e: dict) -> str:
     """One compact human line: ranks, best-chunk sim, rrf parts, bonuses."""
     fts = f"#{e['fts_rank'] + 1}" if e["fts_rank"] is not None else "-"
@@ -861,10 +941,18 @@ def cmd_search(args) -> int:
                        compact=getattr(args, "compact", False))
         return 0
 
+    # With --rerank we retrieve a WIDER window and let the second pass choose
+    # the top N from it: the measured win comes from candidates sitting at rank
+    # 6-20, which a limit-sized first pass never surfaces.
+    rerank = getattr(args, "rerank", False)
+    want = max(limit, RERANK_WINDOW) if rerank else limit
     top, explain = _hybrid_search(
-        conn, cursor, query, limit, filter_sql, filter_params,
+        conn, cursor, query, want, filter_sql, filter_params,
         no_semantic=args.no_semantic, want_explain=getattr(args, "explain", False),
     )
+    if rerank:
+        top = _rerank(query, top, getattr(args, "rerank_model", "haiku"), RERANK_WINDOW)
+    top = top[:limit]
     _timing("total", t_total)
     if not top:
         print("[]" if args.json else f"No results for: {query}")
@@ -893,8 +981,13 @@ def cmd_context(args) -> int:
         return _err("query required (e.g. the project name or current task)")
 
     filter_sql, filter_params = _build_filters(conn, args)
-    top, _ = _hybrid_search(conn, cursor, query, args.limit, filter_sql,
+    rerank = getattr(args, "rerank", False)
+    want = max(args.limit, RERANK_WINDOW) if rerank else args.limit
+    top, _ = _hybrid_search(conn, cursor, query, want, filter_sql,
                             filter_params, no_semantic=args.no_semantic)
+    if rerank:
+        top = _rerank(query, top, getattr(args, "rerank_model", "haiku"), RERANK_WINDOW)
+    top = top[:args.limit]
     if not top:
         print(f"(no brain memories matched: {query})")
         return 0
@@ -979,6 +1072,36 @@ def cmd_context(args) -> int:
 
     _log_recall(conn, [r["id"] for _, r, _, _ in entries])
     return 0
+
+
+def _implicit_feedback(conn: sqlite3.Connection, memory_id: int) -> None:
+    """Record a +1 when a memory that was RECENTLY SURFACED gets opened.
+
+    The explicit `brain feedback` command had exactly one row after a week —
+    a ranking signal nobody feeds is decoration. This is the signal that
+    already exists in the data: `context`/`search` logged that the memory was
+    shown, and an agent then choosing to `get` its full body is the closest
+    thing to "that one was worth reading" that brain can observe without
+    asking anyone to do anything.
+
+    Capped at one implicit vote per memory per day, so a loop that opens the
+    same memory repeatedly cannot inflate it. Opt out with BRAIN_NO_IMPLICIT_FEEDBACK=1.
+    """
+    if os.environ.get("BRAIN_NO_IMPLICIT_FEEDBACK"):
+        return
+    try:
+        if memory_id not in _recently_recalled(conn, hours=24):
+            return                      # not surfaced by brain → not evidence
+        dup = conn.execute(
+            "SELECT 1 FROM memory_feedback WHERE memory_id = ? AND note = 'implicit' "
+            "AND ts > datetime('now', '-1 day') LIMIT 1", (memory_id,)).fetchone()
+        if dup:
+            return
+        conn.execute("INSERT INTO memory_feedback(memory_id, signal, note) "
+                     "VALUES (?, 1, 'implicit')", (memory_id,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass                            # pre-v5 DB, or table missing — never fail `get`
 
 
 def cmd_feedback(args) -> int:
@@ -1068,6 +1191,9 @@ def cmd_get(args) -> int:
         return _err(f"uid {args.uid} not found")
 
     # Update access tracking + recall log (re-extraction guard input).
+    # Implicit feedback BEFORE _log_recall: this `get` must be judged against
+    # an EARLIER surfacing, not against the recall row it is about to write.
+    _implicit_feedback(conn, r["id"])
     conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?", (r["id"],))
     conn.commit()
     _log_recall(conn, [r["id"]])
@@ -2916,6 +3042,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--since-days", type=int, help="only memories from last N days")
     s.add_argument("--no-semantic", action="store_true")
     s.add_argument("--explain", action="store_true", help="show per-result score decomposition")
+    s.add_argument("--rerank", action="store_true",
+                   help="LLM re-rank the top-20 window (vague-query recall@5 0.60 -> ~0.90)")
+    s.add_argument("--rerank-model", default="haiku")
     s.add_argument("--compact", action="store_true", help="uid+title only (~10x fewer tokens/hit)")
     s.add_argument("--include-invalid", action="store_true", help="also show invalidated memories")
     s.add_argument("--as-of", help="time travel: what was true at this date (YYYY-MM-DD)")
@@ -2932,6 +3061,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--since-days", type=int)
     s.add_argument("--no-semantic", action="store_true")
     s.add_argument("--no-blocks", action="store_true", help="omit pinned core blocks")
+    s.add_argument("--rerank", action="store_true", help="LLM re-rank the top-20 window")
+    s.add_argument("--rerank-model", default="haiku")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context)
 
