@@ -541,3 +541,98 @@ def test_secrets_leaves_placeholders_alone(db, tmp_path):
     uid = _save(db, "setup doc", 'export KEY="<YOUR_TOKEN_HERE_PUT_IT_HERE_NOW>"')
     run_brain(db, "secrets", "--extract", "--env-file", str(envf), "--no-embed")
     assert "YOUR_TOKEN_HERE" in run_brain(db, "get", uid).stdout
+
+
+# ── v7: artifact graph ──────────────────────────────────────────────────────
+
+def test_artifact_scan_registers_and_links(db, tmp_path):
+    real = tmp_path / "report.json"
+    real.write_text('{"rows": 1}')
+    _save(db, "the pipeline report", f"output written to {real}")
+    r = run_brain(db, "artifact", "scan")
+    assert r.returncode == 0, r.stderr
+    assert "1 new link" in r.stdout
+    conn = sqlite3.connect(db)
+    a = conn.execute("SELECT path, kind, size, sha256, missing_at FROM artifacts").fetchone()
+    conn.close()
+    # macOS: tmp_path is /private/var/... but the text carries the /var alias
+    assert a[0].endswith("report.json") and a[1] == "file"
+    assert a[2] == len('{"rows": 1}') and a[3] and a[4] is None
+
+
+def test_artifact_scan_ignores_prose_slashes(db):
+    _save(db, "a decision", "we chose and/or semantics, TODO/done tracking, x/y ratio")
+    r = run_brain(db, "artifact", "scan")
+    assert "0 reference(s)" in r.stdout or "artifacts: 0 tracked" in r.stdout
+
+
+def test_artifact_check_detects_missing(db, tmp_path):
+    real = tmp_path / "gone.txt"
+    real.write_text("here")
+    _save(db, "points at a file", f"see {real}")
+    run_brain(db, "artifact", "scan")
+    real.unlink()
+    r = run_brain(db, "artifact", "check")
+    assert "1 newly missing" in r.stdout
+    assert "NEWLY MISSING" in r.stdout
+    # and `get` surfaces it on the memory itself
+    conn = sqlite3.connect(db)
+    uid = conn.execute("SELECT uid FROM memories WHERE title='points at a file'").fetchone()[0]
+    conn.close()
+    assert "MISSING since" in run_brain(db, "get", uid).stdout
+
+
+def test_artifact_check_detects_content_drift(db, tmp_path):
+    real = tmp_path / "drift.txt"
+    real.write_text("original content")
+    _save(db, "cites a file", f"snapshot of {real}")
+    run_brain(db, "artifact", "scan")
+    real.write_text("something completely different now")
+    r = run_brain(db, "artifact", "check")
+    assert "1 changed" in r.stdout and "CHANGED since recorded" in r.stdout
+
+
+def test_artifact_check_detects_reappearance(db, tmp_path):
+    real = tmp_path / "flaky.txt"
+    real.write_text("x")
+    _save(db, "flaky pointer", f"file {real}")
+    run_brain(db, "artifact", "scan")
+    real.unlink()
+    run_brain(db, "artifact", "check")
+    real.write_text("x")
+    r = run_brain(db, "artifact", "check")
+    assert "1 reappeared" in r.stdout
+
+
+def test_artifact_unchanged_file_is_not_flagged(db, tmp_path):
+    real = tmp_path / "stable.txt"
+    real.write_text("steady")
+    _save(db, "stable pointer", f"file {real}")
+    run_brain(db, "artifact", "scan")
+    r = run_brain(db, "artifact", "check")
+    assert "1 unchanged" in r.stdout and "0 changed" in r.stdout
+
+
+def test_artifact_scan_is_idempotent(db, tmp_path):
+    real = tmp_path / "once.txt"
+    real.write_text("y")
+    _save(db, "one pointer", f"file {real}")
+    run_brain(db, "artifact", "scan")
+    run_brain(db, "artifact", "scan")
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM memory_artifacts").fetchone()[0] == 1
+    conn.close()
+
+
+def test_artifact_list_and_dry_run(db, tmp_path):
+    real = tmp_path / "listed.txt"
+    real.write_text("z")
+    _save(db, "listed pointer", f"file {real}")
+    r = run_brain(db, "artifact", "scan", "--dry-run")
+    assert "DRY RUN" in r.stdout
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 0
+    conn.close()
+    run_brain(db, "artifact", "scan")
+    assert "listed.txt" in run_brain(db, "artifact", "list").stdout

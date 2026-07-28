@@ -1090,6 +1090,21 @@ def cmd_get(args) -> int:
         if r["all_tags"]:
             print(f"tags: {r['all_tags']}")
         print(f"\n{r['content'] or ''}\n")
+        # Artifacts: the pointer is only useful with its CURRENT state — a
+        # memory that cites a file is worth much less if the file is gone or
+        # has moved on since the fact was written.
+        arts = _artifacts_for(conn, r["id"])
+        if arts:
+            print("artifacts:")
+            for a in arts:
+                if a["missing_at"]:
+                    state = f"MISSING since {str(a['missing_at'])[:10]}"
+                elif a["changed_at"]:
+                    state = f"CHANGED since {str(a['changed_at'])[:10]} · {_fmt_size(a['size'])}"
+                else:
+                    state = f"{_fmt_size(a['size'])} · {str(a['mtime'] or '')[:10]}"
+                print(f"  {a['path']}  [{state}]")
+            print()
     return 0
 
 
@@ -1832,6 +1847,214 @@ def cmd_anchor(args) -> int:
     verb = "would set" if args.dry_run else "set"
     print(f"{verb} {set_count} anchor(s); {null_count} had no single entity; "
           f"{failed} left unanchored (batch failure)")
+    return 0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v7: artifact graph — pointers to real files, with drift detection
+# ────────────────────────────────────────────────────────────────────────────
+
+# Absolute-ish paths worth tracking. Anchored at real roots so prose like
+# "and/or" or "TODO/done" never registers as a file.
+ARTIFACT_PATH_RE = re.compile(
+    r"(?:~|/Users/[\w.\-]+|/opt|/etc|/var|/srv|/tmp)(?:/[\w.\-@+]+){1,12}/?")
+
+# Above this, record size+mtime but skip the content hash. Hashing a 126MB db
+# on every `artifact check` would make the command something you stop running,
+# and size+mtime already catches the drift that matters.
+ARTIFACT_HASH_CAP = 64 * 1024 * 1024
+
+
+def ensure_artifact_tables(conn: sqlite3.Connection) -> None:
+    """Idempotent (lazy mirror of the v7 migration)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, real_path TEXT NOT NULL,
+            kind TEXT, size INTEGER, sha256 TEXT, mtime TEXT,
+            first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+            last_checked TEXT, missing_at TEXT, changed_at TEXT
+        )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_artifacts (
+            memory_id INTEGER NOT NULL, artifact_id INTEGER NOT NULL,
+            PRIMARY KEY (memory_id, artifact_id)
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memart_artifact "
+                 "ON memory_artifacts(artifact_id)")
+
+
+def _artifact_state(real: Path) -> dict:
+    """stat + (bounded) content hash. Never raises on a vanished/unreadable path."""
+    try:
+        st = real.stat()
+    except (OSError, ValueError):
+        return {"exists": False, "kind": None, "size": None, "sha256": None, "mtime": None}
+    if real.is_dir():
+        return {"exists": True, "kind": "dir", "size": None, "sha256": None,
+                "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(" ", "seconds")}
+    sha = None
+    if st.st_size <= ARTIFACT_HASH_CAP:
+        try:
+            h = hashlib.sha256()
+            with open(real, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(block)
+            sha = h.hexdigest()[:32]
+        except OSError:
+            sha = None
+    return {"exists": True, "kind": "file", "size": st.st_size, "sha256": sha,
+            "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(" ", "seconds")}
+
+
+def _artifact_upsert(conn: sqlite3.Connection, raw_path: str) -> int | None:
+    """Register a path (idempotent), recording its CURRENT state. Returns id."""
+    raw = raw_path.rstrip(".,)`'\"")
+    if len(raw) < 8:
+        return None
+    real = Path(os.path.expanduser(raw))
+    st = _artifact_state(real)
+    row = conn.execute("SELECT id FROM artifacts WHERE path = ?", (raw,)).fetchone()
+    if row:
+        return row["id"]
+    cur = conn.execute(
+        "INSERT INTO artifacts(path, real_path, kind, size, sha256, mtime, last_checked, "
+        "missing_at) VALUES (?,?,?,?,?,?, datetime('now'), ?)",
+        (raw, str(real), st["kind"], st["size"], st["sha256"], st["mtime"],
+         None if st["exists"] else _now()))
+    return cur.lastrowid
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _artifacts_for(conn: sqlite3.Connection, memory_id: int) -> list[sqlite3.Row]:
+    try:
+        return list(conn.execute(
+            "SELECT a.* FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id = a.id "
+            "WHERE ma.memory_id = ? ORDER BY a.path", (memory_id,)))
+    except sqlite3.OperationalError:
+        return []
+
+
+def _fmt_size(n: int | None) -> str:
+    if n is None:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return str(n)
+
+
+def cmd_artifact(args) -> int:
+    """Track the real files memories point at, and whether they still exist.
+
+    A memory cannot carry a 126MB dump, so it carries a pointer plus the
+    file's state when the fact was written. `check` re-stats everything, so a
+    memory can tell you not only where the file is but whether it still says
+    what it said.
+    """
+    conn = connect()
+    ensure_artifact_tables(conn)
+    conn.commit()
+    action = args.action
+
+    if action == "scan":
+        live = "deleted_at IS NULL AND invalid_at IS NULL"
+        found, linked = 0, 0
+        for r in conn.execute(f"SELECT id, title, content FROM memories WHERE {live}"):
+            seen = set()
+            for m in ARTIFACT_PATH_RE.finditer(f"{r['title']}\n{r['content'] or ''}"):
+                raw = m.group(0).rstrip(".,)`'\"")
+                if raw in seen:
+                    continue
+                seen.add(raw)
+                if args.dry_run:
+                    found += 1
+                    continue
+                aid = _artifact_upsert(conn, raw)
+                if aid is None:
+                    continue
+                found += 1
+                try:
+                    conn.execute("INSERT INTO memory_artifacts(memory_id, artifact_id) "
+                                 "VALUES (?,?)", (r["id"], aid))
+                    linked += 1
+                except sqlite3.IntegrityError:
+                    pass
+        if args.dry_run:
+            print(f"DRY RUN: would register {found} path reference(s)")
+            return 0
+        conn.commit()
+        total = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+        missing = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE missing_at IS NOT NULL").fetchone()[0]
+        print(f"scanned: {found} reference(s), {linked} new link(s)")
+        print(f"artifacts: {total} tracked, {missing} missing ({missing * 100 // max(total, 1)}%)")
+        return 0
+
+    if action == "check":
+        rows = list(conn.execute("SELECT * FROM artifacts"))
+        if not rows:
+            return _err("no artifacts tracked — run `brain artifact scan` first")
+        vanished, restored, changed, ok = [], [], [], 0
+        for a in rows:
+            st = _artifact_state(Path(a["real_path"]))
+            if not st["exists"]:
+                if a["missing_at"] is None:
+                    vanished.append(a)
+                    conn.execute("UPDATE artifacts SET missing_at=?, last_checked=datetime('now') "
+                                 "WHERE id=?", (_now(), a["id"]))
+                else:
+                    conn.execute("UPDATE artifacts SET last_checked=datetime('now') WHERE id=?",
+                                 (a["id"],))
+                continue
+            drifted = (a["sha256"] and st["sha256"] and a["sha256"] != st["sha256"]) or \
+                      (a["sha256"] is None and a["size"] is not None and st["size"] != a["size"])
+            if a["missing_at"] is not None:
+                restored.append(a)
+            elif drifted:
+                changed.append(a)
+            else:
+                ok += 1
+            conn.execute(
+                "UPDATE artifacts SET kind=?, size=?, sha256=?, mtime=?, missing_at=NULL, "
+                "last_checked=datetime('now'), changed_at=CASE WHEN ? THEN ? ELSE changed_at END "
+                "WHERE id=?",
+                (st["kind"], st["size"], st["sha256"], st["mtime"],
+                 1 if drifted else 0, _now(), a["id"]))
+        conn.commit()
+        print(f"checked {len(rows)} artifact(s): {ok} unchanged, {len(changed)} changed, "
+              f"{len(vanished)} newly missing, {len(restored)} reappeared")
+        for label, group in (("CHANGED since recorded", changed),
+                             ("NEWLY MISSING", vanished), ("REAPPEARED", restored)):
+            if not group:
+                continue
+            print(f"\n{label}:")
+            for a in group[:args.limit]:
+                n = conn.execute("SELECT COUNT(*) FROM memory_artifacts WHERE artifact_id=?",
+                                 (a["id"],)).fetchone()[0]
+                print(f"  {a['path']}  ({n} memories, was {_fmt_size(a['size'])})")
+            if len(group) > args.limit:
+                print(f"  … {len(group) - args.limit} more")
+        return 0
+
+    # list
+    where = ""
+    if args.missing:
+        where = "WHERE missing_at IS NOT NULL"
+    elif args.large:
+        where = "WHERE size >= 200000 AND missing_at IS NULL"
+    rows = list(conn.execute(
+        f"SELECT a.*, (SELECT COUNT(*) FROM memory_artifacts m WHERE m.artifact_id=a.id) n "
+        f"FROM artifacts a {where} ORDER BY n DESC, a.size DESC LIMIT ?", (args.limit,)))
+    if not rows:
+        print("(no artifacts — `brain artifact scan`)")
+        return 0
+    for a in rows:
+        flag = "GONE" if a["missing_at"] else ("DRIFT" if a["changed_at"] else "ok  ")
+        print(f"  {flag}  {_fmt_size(a['size']):>8}  {a['n']:3} mem  {a['path']}")
     return 0
 
 
@@ -2711,6 +2934,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-blocks", action="store_true", help="omit pinned core blocks")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_context)
+
+    # artifacts
+    s = sub.add_parser("artifact",
+                       help="Track the real files memories point at (pointer + drift detection)")
+    s.add_argument("action", choices=["scan", "check", "list"], nargs="?", default="list")
+    s.add_argument("--missing", action="store_true", help="list only: vanished files")
+    s.add_argument("--large", action="store_true", help="list only: >=200KB")
+    s.add_argument("--limit", type=int, default=25)
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_artifact)
 
     # secrets
     s = sub.add_parser("secrets",
