@@ -277,9 +277,14 @@ python3 scripts/eval.py --golden tests/fixtures/golden_synthetic.jsonl \
 `BRAIN_DB` is honored by both `brain.py` and `scripts/migrate.py`; unset, both
 default to `~/brain.db`.
 
+## MCP server
+
+An MCP server wrapper exposing brain as 6 tools (`brain_save`, `brain_search`,
+`brain_get`, `brain_context`, `brain_link`, `brain_feedback`) over stdio/HTTP
+lives in `mcp/` — see [mcp/README.md](mcp/README.md).
+
 ## Roadmap
 
 - v3.1 — `brain task` subcommands (done, list, due) so task ops escape raw SQL too
 - v3.2 — soft archive (compress + offload memories > 2 years to cold storage)
-- v3.3 — MCP server wrapper (same core, exposed as MCP tools for Claude Code)
 - v3.4 — automatic relation inference (LLM proposes `caused_by` / `superseded_by` links)
