@@ -1,12 +1,27 @@
 # brain — local memory for AI agents, in a single Python file
 
+[![CI](https://github.com/victorsabino/brain-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/victorsabino/brain-cli/actions/workflows/ci.yml)
+
+Your coding agent forgets everything the moment the session ends. `brain`
+gives it a persistent local memory it can search — one SQLite file, no
+server, no cloud.
+
+**Example output** (`brain search "deploy regression" --explain`):
+
+```
+[bug     ] Rollback loop on deploy (acme)
+           ...
+           2026-05-01 · ab12cd34ef56 · score=1.05  #deploy
+           ↳ fts=#1 sem=#2 sim=0.712 rrf=0.500+0.492 rec=+0.044 acc=+0.011 = 1.047
+```
+
 A persistent memory / personal knowledge base CLI for LLM coding agents
 (Claude Code, Cursor, custom agents) and humans: save, search, link and dedupe learnings,
 decisions, bugs, snippets and tasks in one local SQLite file. Hybrid
 semantic + keyword search — porter-stemmed FTS5 plus chunked 384-dim
 embeddings (sqlite-vec, cosine) fused with reciprocal rank fusion (RRF).
 No server, no cloud, no SQL required: typed argparse commands over
-`~/brain.db` (override with `BRAIN_DB=/path/to.db`). The v3 schema is
+`~/brain.db` (override with `BRAIN_DB=/path/to.db`). The schema is
 additive over any existing `memories` table; no destructive migration.
 
 Works with any agent that can run a shell command: Claude Code, Cursor,
@@ -42,7 +57,7 @@ brain block set persona "Terse. No preamble."  # pinned context, injected every 
 brain link  <src_uid> <dst_uid> <kind>
 brain stats · brain recent 20
 brain reindex     # backfill embeddings
-brain migrate     # apply schema (v5)
+brain migrate     # apply schema (currently v8)
 ```
 
 ## What it fixes
@@ -94,7 +109,8 @@ Additive over the original `memories`, `memories_fts`, `stats` tables.
 - `query_cache(qhash, embedding, created_at)` — query-embedding cache (lazy,
   capped at 500 rows)
 
-**Schema version marker**: `stats.brain_schema_version = '3'`.
+**Schema version marker**: `stats.brain_schema_version` (currently `'8'`;
+`brain migrate` / `scripts/migrate.py` always brings a DB to the latest).
 
 ## Search
 
@@ -259,9 +275,8 @@ Design rationale and invariants: [DESIGN.md](DESIGN.md) · release history:
 [CHANGELOG.md](CHANGELOG.md).
 
 ```bash
-# Tests (smoke + update/history suites; FTS-only, no heavy deps needed)
-python3 tests/test_brain.py
-python3 -m pytest tests/test_update_history.py -q
+# Full test suite (pytest, hermetic — every test builds its own tmp_path DB)
+uv run pytest -q
 
 # Never develop against your live ~/brain.db — use the BRAIN_DB seam:
 cp ~/brain.db /tmp/dev.db

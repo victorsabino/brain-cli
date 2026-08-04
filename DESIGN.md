@@ -30,7 +30,7 @@ memories (id PK, uid, title, content, canonical_type, project,
    └── query_cache         query-embedding cache (qhash PK, embedding BLOB,
                            created_at) — lazy-created, cap 500 / evict 100
 
-stats.brain_schema_version = '3'
+stats.brain_schema_version = '8'   # SCHEMA_VERSION in scripts/migrate.py
 ```
 
 ## Invariants (do not break)
@@ -89,7 +89,7 @@ stats.brain_schema_version = '3'
 
 ## Why single-file + uv inline deps
 
-`brain.py` is one ~950-line module with PEP 723 inline dependencies on
+`brain.py` is one ~3282-line module with PEP 723 inline dependencies on
 purpose:
 
 - The primary caller is an LLM agent: one file to read = full system
