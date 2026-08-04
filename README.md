@@ -123,6 +123,25 @@ Two ranked candidate lists, fused by rank — never by raw score:
    (384-dim, multilingual), KNN over `memory_chunks` (cosine), best chunk per
    memory.
 
+```mermaid
+flowchart LR
+    Q["Query"] --> FTS["FTS5 BM25<br/>porter-stemmed keyword"]
+    Q --> KNN["sqlite-vec KNN<br/>cosine, chunked 384-dim"]
+    FTS --> RRF["Reciprocal Rank Fusion<br/>+ recency / access / feedback tiebreakers"]
+    KNN --> RRF
+    RRF --> Gate{"rerank enabled?"}
+    Gate -- yes --> LLM["claude -p haiku<br/>rerank top 20 by meaning"]
+    Gate -- no --> Results["Results"]
+    LLM --> Results
+```
+
+Reranking (`--rerank`) is optional and off by default: it widens the first
+pass to a 20-candidate window and asks `claude -p` (haiku by default) to
+reorder those 20 by meaning rather than word overlap, fixing the case where
+the right memory is retrieved but buried below rank 5. It fails safe — any
+error, timeout, or malformed output returns the original fused order
+untouched.
+
 ```
 score = RRF / (2/(k+1))            # reciprocal-rank fusion, k=60, normalized
       + 0.05 * exp(-age_days/365)  # recency: additive tiebreaker
@@ -294,9 +313,18 @@ default to `~/brain.db`.
 
 ## MCP server
 
-An MCP server wrapper exposing brain as 6 tools (`brain_save`, `brain_search`,
-`brain_get`, `brain_context`, `brain_link`, `brain_feedback`) over stdio/HTTP
-lives in `mcp/` — see [mcp/README.md](mcp/README.md).
+An MCP server wrapper exposing brain as 6 tools over stdio (default) or
+streamable-http (`BRAIN_MCP_TRANSPORT=http`) lives in `mcp/` — see
+[mcp/README.md](mcp/README.md) for setup and run instructions.
+
+| Tool | Purpose |
+| --- | --- |
+| `brain_save` | Store a durable fact (`type` one of learning, decision, bug, snippet, note, task, person, project). `content` is the WHY, `abstract` is the one-line summary `brain_context` injects. Duplicate title+content returns the existing uid unless `force=true`. |
+| `brain_search` | Search by meaning and keyword together (BM25 + embeddings, fused RRF). Matches half-remembered phrasing, not just exact words. Returns uid + title + a 300-char snippet; filter with `type`, `project`, `since_days`, `include_invalid`, `as_of`. |
+| `brain_get` | Fetch one memory in full by uid, with tags, project, anchor, and invalidated/superseded status. Reading also feeds search ranking, so prefer it over re-searching. |
+| `brain_context` | Compact, token-budgeted briefing (one-line abstracts) of everything relevant to a topic, plus pinned always-on facts. Call once at the start of work; `budget` (default 2000) hard-caps the token spend. |
+| `brain_link` | Record a typed relationship between two memories by uid: `cites`, `caused_by`, `fixed_by`, `superseded_by`, `blocks`, `related_to`, `duplicate_of`. Re-linking an existing pair is a no-op. |
+| `brain_feedback` | Signal that a memory was genuinely useful (`up`) or misleading (`down`), adjusting its search ranking. A factually wrong memory should instead be superseded via `brain_save` + `brain_link(kind="superseded_by")`. |
 
 ## Roadmap
 
