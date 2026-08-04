@@ -1249,7 +1249,10 @@ def cmd_link(args) -> int:
         print(f"linked {args.src} --[{args.kind}]--> {args.dst}")
         return 0
     except sqlite3.IntegrityError:
+        conn.rollback()
         return _err("link already exists")
+    finally:
+        conn.close()
 
 
 def cmd_delete(args) -> int:

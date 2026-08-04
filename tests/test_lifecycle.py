@@ -64,6 +64,32 @@ def test_as_of_time_travel(db):
     assert uid not in r.stdout
 
 
+# ── link ────────────────────────────────────────────────────────────────────
+
+def test_link_duplicate_does_not_leak_connection(db):
+    """Regression: cmd_link left an uncommitted transaction open on the
+    IntegrityError path (linking an already-linked pair), which could hold a
+    WAL lock and make the NEXT `brain` invocation fail with
+    'database is locked'. Two separate `brain link` subprocess calls back to
+    back reproduce the original bug (each opens its own connect()).
+    """
+    a = _save(db, "fact alpha", "alpha body")
+    b = _save(db, "fact beta", "beta body")
+
+    r = run_brain(db, "link", a, b, "related_to")
+    assert r.returncode == 0, r.stderr
+
+    # Hits the IntegrityError ("link already exists") path in cmd_link.
+    r = run_brain(db, "link", a, b, "related_to")
+    assert r.returncode == 1
+    assert "link already exists" in r.stderr
+
+    # A fresh connect() + write right after must NOT hit "database is locked".
+    r = run_brain(db, "link", a, b, "duplicate_of")
+    assert r.returncode == 0, r.stderr
+    assert "database is locked" not in (r.stderr + r.stdout)
+
+
 # ── reconcile ───────────────────────────────────────────────────────────────
 
 def test_reconcile_exact_duplicate_noops(db):
