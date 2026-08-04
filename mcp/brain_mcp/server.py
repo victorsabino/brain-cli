@@ -205,6 +205,19 @@ def main() -> None:
     adapter.ensure_db()
     transport = os.environ.get("BRAIN_MCP_TRANSPORT", "stdio")
     if transport == "http":
+        token = os.environ.get("BRAIN_MCP_TOKEN")
+        if not token:
+            raise SystemExit(
+                "BRAIN_MCP_TRANSPORT=http requires BRAIN_MCP_TOKEN to be set "
+                "(a bearer token guarding the HTTP endpoint) — refusing to "
+                "start unauthenticated. Generate one with: "
+                'python3 -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        from fastmcp.server.auth import StaticTokenVerifier
+
+        mcp.auth = StaticTokenVerifier(
+            tokens={token: {"client_id": "brain-mcp-owner", "scopes": []}}
+        )
         host = os.environ.get("BRAIN_MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("BRAIN_MCP_PORT", "8000"))
         mcp.run(transport="streamable-http", host=host, port=port)
